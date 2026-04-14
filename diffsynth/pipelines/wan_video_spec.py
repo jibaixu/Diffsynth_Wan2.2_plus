@@ -59,6 +59,7 @@ class WanRuntimeConfig:
     text_mode: WanTextMode
     action_mode: WanActionMode
     image_mode: WanImageMode
+    track_context_enabled: bool
     enable_text: bool
     enable_text_encoder: bool
     action_enabled: bool
@@ -75,6 +76,7 @@ class WanModuleSpec:
     text_mode: WanTextMode
     action_mode: WanActionMode
     image_mode: WanImageMode
+    track_context_enabled: bool
 
     @classmethod
     def parse(cls, load_modules) -> "WanModuleSpec":
@@ -93,6 +95,7 @@ class WanModuleSpec:
         text_mode: WanTextMode = "off"
         action_mode: WanActionMode = "off"
         image_mode: WanImageMode = "default"
+        track_context_enabled = False
 
         def remember(base: str, normalized: str) -> None:
             if base not in normalized_by_base:
@@ -152,6 +155,17 @@ class WanModuleSpec:
                     continue
                 raise ValueError(f"Unsupported WAN image module spec: {raw_module!r}")
 
+            if base == "trackctx":
+                if variant is None:
+                    remember("trackctx", "trackctx")
+                    track_context_enabled = True
+                    continue
+                if variant == "off":
+                    drop("trackctx")
+                    track_context_enabled = False
+                    continue
+                raise ValueError(f"Unsupported WAN track-context module spec: {raw_module!r}")
+
             if base in ("dit", "vae"):
                 if variant is not None:
                     raise ValueError(f"Unsupported WAN module variant: {raw_module!r}")
@@ -165,6 +179,7 @@ class WanModuleSpec:
             text_mode=text_mode,
             action_mode=action_mode,
             image_mode=image_mode,
+            track_context_enabled=track_context_enabled,
         )
 
     @property
@@ -224,6 +239,11 @@ class WanModuleSpec:
         else:
             keys = [key for key in keys if key != "action"]
 
+        if self.track_context_enabled:
+            ensure("track")
+        else:
+            keys = [key for key in keys if key != "track"]
+
         model_paths: list[WanModelPath] = []
         for module in self.weight_modules:
             candidates = WAN_MODULE_FILES.get(module)
@@ -239,6 +259,7 @@ class WanModuleSpec:
             text_mode=self.text_mode,
             action_mode=self.action_mode,
             image_mode=self.image_mode,
+            track_context_enabled=self.track_context_enabled,
             enable_text=self.enable_text,
             enable_text_encoder=self.enable_text_encoder,
             action_enabled=self.action_enabled,

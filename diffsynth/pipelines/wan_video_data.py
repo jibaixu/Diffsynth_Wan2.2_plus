@@ -1,7 +1,7 @@
 from typing import Iterable, Optional
 
 from ..core import UnifiedDataset
-from ..core.data.operators import LoadCobotAction, ResolvePromptEmbPath
+from ..core.data.operators import LoadCobotAction, LoadTrackMapVideo, ResolvePromptEmbPath
 from .wan_video_spec import WanRuntimeConfig
 
 
@@ -53,6 +53,11 @@ def build_wan_video_dataset(
     width_division_factor: int = 16,
     time_division_factor: int = 4,
     time_division_remainder: int = 1,
+    track_num_points: int = 256,
+    track_point_radius: int = 6,
+    track_seed: int = 42,
+    track_apply_noise: bool = False,
+    track_noise_std: float = 0.0,
 ) -> UnifiedDataset:
     keys = _normalize_data_file_keys(data_file_keys, runtime.data_file_keys)
     operator_num_frames = int(dataset_num_frames) if dataset_num_frames is not None else int(num_frames)
@@ -86,6 +91,21 @@ def build_wan_video_dataset(
         temporal_num_frames=int(num_frames),
         temporal_num_history_frames=int(num_history_frames),
     )
+
+    if runtime.track_context_enabled:
+        dataset.special_operator_map["track"] = LoadTrackMapVideo(
+            base_path=base_path,
+            height=height,
+            width=width,
+            num_frames=operator_num_frames,
+            time_division_factor=time_division_factor,
+            time_division_remainder=time_division_remainder,
+            num_points=track_num_points,
+            point_radius=track_point_radius,
+            seed=track_seed,
+            apply_noise=track_apply_noise,
+            noise_std=track_noise_std,
+        )
 
     if "action" not in keys:
         return dataset

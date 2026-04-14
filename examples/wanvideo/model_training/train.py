@@ -1,3 +1,37 @@
+def debug_on():
+    import sys, os
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    sys.argv = [
+        "examples/wanvideo/model_training/train.py",
+        "--dataset_base_path", "/data_jbx/Codes/Diffsynth_Wan2.2_plus/data/4_4_four_tasks_wan",
+        "--dataset_metadata_path", "/data_jbx/Codes/Diffsynth_Wan2.2_plus/data/4_4_four_tasks_wan/meta/episodes_train.track_bert.jsonl",
+        "--action_stat_path", "/data_jbx/Codes/Diffsynth_Wan2.2_plus/data/4_4_four_tasks_wan/meta/stat.json",
+        "--action_type", "action_pose",
+        "--height", "480",
+        "--width", "640",
+        "--dataset_num_workers", "4",
+        "--num_frames", "17",
+        "--spatial_division_factor", "32",
+        "--dataset_repeat", "1",
+        "--model_paths", "/data1/modelscope/models/Wan-AI/Wan2.2-TI2V-5B",
+        "--ckpt_path", "/data_jbx/Codes/Diffsynth_Wan2.2_plus/Ckpt/4_6_robot_four_task/epoch-199/epoch-199.safetensors",
+        "--trainable_models", "track_context",
+        "--learning_rate", "8e-5",
+        "--num_epochs", "200",
+        "--mixed_precision", "bf16",
+        "--output_path", "Ckpt/tmp",
+        "--gradient_accumulation_steps", "8",
+        "--use_swanlab", "0",
+        "--swanlab_experiment_name", "Wan_ATM_Map_0413",
+        "--load_modules", "dit,text:emb,vae,image:off,action:noise,trackctx",
+        "--num_history_frames", "1",
+        "--history_template_sampling", "0",
+        "--track_apply_noise", "1",
+        "--track_noise_std", "0.003",
+    ]
+debug_on()
+
 import torch, os, argparse, accelerate, random, json
 import numpy as np
 from diffsynth.core import load_wan_checkpoint_into_pipeline
@@ -38,6 +72,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         num_history_frames=1,
         history_template_sampling=0,
         num_frames=17,
+        track_context_scale=1.0,
     ):
         super().__init__()
         module_spec = WanModuleSpec.parse(modules)
@@ -89,6 +124,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.min_timestep_boundary = min_timestep_boundary
         self.num_history_frames = num_history_frames
         self.history_template_sampling = int(history_template_sampling)
+        self.track_context_scale = float(track_context_scale)
 
     def get_pipeline_inputs(self, data): 
         inputs_posi = {
@@ -102,12 +138,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared = {
             "input_video": data["video"],
             "action": data.get("action"),
+            "track": data.get("track"),
             "height": int(data["video"].shape[-2]),
             "width": int(data["video"].shape[-1]),
             "num_frames": int(data["video"].shape[2]),
             "num_history_frames": self.num_history_frames,
             "history_template_sampling": self.history_template_sampling,
             "temporal_future_start": data.get("temporal_future_start"),
+            "track_context_scale": self.track_context_scale,
             "cfg_scale": 1,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -151,15 +189,17 @@ if __name__ == "__main__":
     modules = runtime.modules
     data_file_keys = runtime.data_file_keys
     action_enabled = runtime.action_enabled
+    track_context_enabled = runtime.track_context_enabled
 
     trainable_models = args.trainable_models
     if not trainable_models:
         trainable_models = "dit"
-    if action_enabled:
-        models = [m.strip() for m in str(trainable_models).split(",") if m.strip()]
-        if all(m == "dit" for m in models):
-            models.append("action_encoder")
-            trainable_models = ",".join(models)
+    models = [m.strip() for m in str(trainable_models).split(",") if m.strip()]
+    if action_enabled and "action_encoder" not in models and all(m == "dit" for m in models):
+        models.append("action_encoder")
+    if track_context_enabled and "track_context" not in models:
+        models.append("track_context")
+    trainable_models = ",".join(models)
     model_paths_json = json.dumps(runtime.model_paths)
     tokenizer_path = runtime.tokenizer_path
     log_with = []
@@ -193,6 +233,11 @@ if __name__ == "__main__":
         width_division_factor=args.spatial_division_factor,
         time_division_factor=4,
         time_division_remainder=1,
+        track_num_points=args.track_num_points,
+        track_point_radius=args.track_point_radius,
+        track_seed=args.track_seed,
+        track_apply_noise=bool(args.track_apply_noise),
+        track_noise_std=args.track_noise_std,
     )
     model = WanTrainingModule(
         model_paths=model_paths_json,
@@ -219,6 +264,7 @@ if __name__ == "__main__":
         num_history_frames=args.num_history_frames,
         history_template_sampling=args.history_template_sampling,
         num_frames=args.num_frames,
+        track_context_scale=args.track_context_scale,
     )
     model_logger = ModelLogger(
         args.output_path,

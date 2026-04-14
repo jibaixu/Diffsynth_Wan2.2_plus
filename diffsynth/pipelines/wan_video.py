@@ -12,6 +12,7 @@ from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
 from ..models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from ..models.wan_video_action_encoder import WanVideoActionEncoder
+from ..models.wan_video_track_context import TrackContextWanModel
 from ..models.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 from ..models.wan_video_vae import WanVideoVAE
 from ..models.wan_video_image_encoder import WanImageEncoder
@@ -38,13 +39,15 @@ class WanVideoPipeline(BasePipeline):
         self.enable_text_encoder = self.module_spec.enable_text_encoder
         self.clip_mode = self.module_spec.clip_mode
         self.action_injection_mode = self.module_spec.action_mode
+        self.track_context_enabled = self.module_spec.track_context_enabled
         self.tokenizer: HuggingfaceTokenizer = None
         self.text_encoder: WanTextEncoder = None
         self.image_encoder: WanImageEncoder = None
         self.dit: WanModel = None
         self.action_encoder: WanVideoActionEncoder = None
+        self.track_context: TrackContextWanModel = None
         self.vae: WanVideoVAE = None
-        self.in_iteration_models = ("dit",)
+        self.in_iteration_models = ("dit", "track_context")
         self.units = [
             WanVideoUnit_ShapeChecker(),
             WanVideoUnit_NoiseInitializer(),
@@ -57,10 +60,39 @@ class WanVideoPipeline(BasePipeline):
             self.units.append(WanVideoUnit_PromptEmbedder())
         if self.action_injection_mode != "off":
             self.units.append(WanVideoUnit_ActionEmbedder())
+        if self.track_context_enabled:
+            self.units.append(WanVideoUnit_TrackContext())
 
 
     def model_fn(self, *args, **kwargs):
         return model_fn_wan_video(*args, action_injection_mode=self.action_injection_mode, **kwargs)
+
+    @staticmethod
+    def create_track_context_from_dit(
+        dit: WanModel,
+        track_in_dim: int = 16,
+        zero_init_extra: bool = True,
+    ) -> TrackContextWanModel:
+        num_layers = len(dit.blocks)
+        if num_layers == 30:
+            track_layers = (0, 4, 8, 12, 16, 20, 24, 28)
+        elif num_layers <= 8:
+            track_layers = tuple(range(num_layers))
+        else:
+            track_layers = tuple(sorted({round(i * (num_layers - 1) / 7) for i in range(8)}))
+        track_context = TrackContextWanModel(
+            track_layers=track_layers,
+            track_in_dim=track_in_dim,
+            patch_size=tuple(dit.patch_size),
+            has_image_input=getattr(dit, "has_image_input", False),
+            has_text_input=getattr(dit, "has_text_input", True),
+            dim=dit.dim,
+            num_heads=dit.blocks[0].num_heads if len(dit.blocks) > 0 else 12,
+            ffn_dim=dit.blocks[0].ffn_dim if len(dit.blocks) > 0 else dit.dim * 4,
+            eps=dit.blocks[0].norm1.eps if len(dit.blocks) > 0 else 1e-6,
+        )
+        track_context.init_from_dit(dit, zero_init_extra=zero_init_extra)
+        return track_context
 
 
     @staticmethod
@@ -76,6 +108,7 @@ class WanVideoPipeline(BasePipeline):
         module_spec = WanModuleSpec.parse(modules)
         modules = list(module_spec.modules)
         action_enabled = module_spec.action_enabled
+        track_context_enabled = module_spec.track_context_enabled
 
         # Redirect model path
         if redirect_common_files:
@@ -123,6 +156,16 @@ class WanVideoPipeline(BasePipeline):
             pipe.action_encoder = WanVideoActionEncoder(action_dim=action_dim, dim=dim)
             pipe.action_encoder = pipe.action_encoder.to(dtype=pipe.torch_dtype, device=pipe.device)
 
+        if track_context_enabled:
+            if pipe.dit is None:
+                raise ValueError("`trackctx` requires a loaded WAN DiT backbone.")
+            track_in_dim = int(getattr(getattr(pipe.vae, "model", None), "z_dim", 16))
+            pipe.track_context = WanVideoPipeline.create_track_context_from_dit(
+                pipe.dit,
+                track_in_dim=track_in_dim,
+                zero_init_extra=True,
+            ).to(dtype=pipe.torch_dtype, device=pipe.device)
+
         # Size division factor
         if pipe.vae is not None:
             pipe.height_division_factor = pipe.vae.upsampling_factor * 2
@@ -159,6 +202,8 @@ class WanVideoPipeline(BasePipeline):
         num_history_frames=1,
         # Action conditioning
         action: Optional[torch.Tensor] = None,
+        track: Optional[torch.Tensor] = None,
+        track_context_scale: float = 1.0,
         # Classifier-free guidance
         cfg_scale: Optional[float] = 5.0,
         # Scheduler
@@ -200,6 +245,8 @@ class WanVideoPipeline(BasePipeline):
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames, "num_history_frames": num_history_frames,
             "action": action,
+            "track": track,
+            "track_context_scale": track_context_scale,
             "cfg_scale": cfg_scale,
             "sigma_shift": sigma_shift,
             "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
@@ -489,6 +536,38 @@ class WanVideoUnit_ActionEmbedder(PipelineUnit): # infer & train &5b
         return {"action_emb": action_emb}
 
 
+class WanVideoUnit_TrackContext(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            input_params=("track", "tiled", "tile_size", "tile_stride"),
+            output_params=("track_context_latents",),
+            onload_model_names=("vae", "track_context"),
+        )
+
+    def process(self, pipe: WanVideoPipeline, track, tiled, tile_size, tile_stride) -> dict:
+        if track is None or pipe.track_context is None or pipe.vae is None:
+            return {}
+
+        pipe.load_models_to_device(self.onload_model_names)
+        track = torch.as_tensor(track, device=pipe.device, dtype=pipe.torch_dtype)
+        if track.ndim == 4:
+            track = track.unsqueeze(0)
+        if track.ndim != 5:
+            raise ValueError(f"Expected track video tensor shape (V,C,T,H,W) or (C,T,H,W), got {tuple(track.shape)}")
+
+        with torch.no_grad():
+            track_context_latents = pipe.vae.encode(
+                track,
+                device=pipe.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+        track_context_latents = track_context_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
+        track_context_latents = rearrange(track_context_latents, "v c t h w -> 1 c t (v h) w")
+        return {"track_context_latents": track_context_latents.detach()}
+
+
 class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit): #infer & train & no 5b
     """
     CLIP 图像编码器单元
@@ -624,12 +703,15 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit): # infer & train && 5b
 
 def model_fn_wan_video(
     dit: WanModel,
+    track_context: Optional[TrackContextWanModel] = None,
     latents: torch.Tensor = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     action_emb: Optional[torch.Tensor] = None,
     action_mod_emb: Optional[torch.Tensor] = None,
     action_injection_mode: str = "off",
+    track_context_latents: Optional[torch.Tensor] = None,
+    track_context_scale: float = 1.0,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     fuse_vae_embedding_in_latents: bool = False,
@@ -755,7 +837,20 @@ def model_fn_wan_video(
             return module(*inputs)
         return custom_forward
 
-    for block in dit.blocks:
+    track_hints = None
+    if track_context is not None and track_context_latents is not None:
+        track_hints = track_context(
+            x,
+            track_context_latents,
+            context,
+            t_mod,
+            freqs,
+            text_token_count=text_token_count,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
+
+    for block_id, block in enumerate(dit.blocks):
         block.cross_attn.text_token_count = text_token_count
         if use_gradient_checkpointing_offload:
             with torch.autograd.graph.save_on_cpu():
@@ -774,6 +869,10 @@ def model_fn_wan_video(
         else:
             # 正常前向传播 (最快,但显存占用最大)
             x = block(x, context, t_mod, freqs)
+
+        if track_hints is not None and block_id in track_context.track_layers_mapping:
+            hint_id = track_context.track_layers_mapping[block_id]
+            x = x + track_hints[hint_id] * float(track_context_scale)
 
     # ========== 步骤7: 输出投影和 Unpatchify ==========
     # 7.1 使用最终的 head 层进行输出投影

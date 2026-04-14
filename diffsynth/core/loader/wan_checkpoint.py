@@ -6,6 +6,7 @@ from .file import load_keys_dict, load_state_dict
 
 
 ActionPrefix = "pipe.action_encoder."
+TrackContextPrefix = "pipe.track_context."
 UnsupportedPrefixes = ("action_encoder.", "dit.")
 
 
@@ -13,15 +14,18 @@ UnsupportedPrefixes = ("action_encoder.", "dit.")
 class WanCheckpointStats:
     dit_key_count: int
     action_key_count: int
+    track_context_key_count: int
     ignored_key_count: int
 
 
 def _classify_checkpoint_key(
     key: str,
     dit_key_filter: Optional[Callable[[str], bool]] = None,
-) -> tuple[Literal["dit", "action_encoder", "ignore", "skip"], Optional[str]]:
+) -> tuple[Literal["dit", "action_encoder", "track_context", "ignore", "skip"], Optional[str]]:
     if key.startswith(ActionPrefix):
         return "action_encoder", key[len(ActionPrefix):]
+    if key.startswith(TrackContextPrefix):
+        return "track_context", key[len(TrackContextPrefix):]
     if key.startswith(UnsupportedPrefixes):
         return "ignore", None
     if key.startswith("pipe."):
@@ -68,7 +72,7 @@ def load_wan_checkpoint_into_pipeline(
 
     def keep_checkpoint_key(key: str) -> bool:
         target, _ = _classify_checkpoint_key(key, dit_key_filter)
-        return target in ("dit", "action_encoder")
+        return target in ("dit", "action_encoder", "track_context")
 
     state_dict = load_state_dict(
         ckpt_path,
@@ -79,12 +83,15 @@ def load_wan_checkpoint_into_pipeline(
 
     dit_state = {}
     action_state = {}
+    track_context_state = {}
     for key, value in state_dict.items():
         target, normalized_key = _classify_checkpoint_key(key, dit_key_filter)
         if target == "dit":
             dit_state[normalized_key] = value
         elif target == "action_encoder":
             action_state[normalized_key] = value
+        elif target == "track_context":
+            track_context_state[normalized_key] = value
 
     def load_component(name: str, module, component_state: dict) -> None:
         if not component_state:
@@ -100,6 +107,7 @@ def load_wan_checkpoint_into_pipeline(
 
     load_component("dit", getattr(pipe, "dit", None), dit_state)
     load_component("action_encoder", getattr(pipe, "action_encoder", None), action_state)
+    load_component("track_context", getattr(pipe, "track_context", None), track_context_state)
 
     if ignored_key_count > 0:
         log_info(f"  - Ignored {ignored_key_count} keys with unsupported checkpoint prefixes")
@@ -107,5 +115,6 @@ def load_wan_checkpoint_into_pipeline(
     return WanCheckpointStats(
         dit_key_count=len(dit_state),
         action_key_count=len(action_state),
+        track_context_key_count=len(track_context_state),
         ignored_key_count=ignored_key_count,
     )

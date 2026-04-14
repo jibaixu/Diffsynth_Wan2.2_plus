@@ -1,3 +1,4 @@
+import colorsys
 import torch, torchvision, imageio, os, math
 import numpy as np
 import pyarrow.parquet as pq
@@ -728,3 +729,224 @@ class LoadCobotAction(DataProcessingOperator):
         min_vals, max_vals = self._get_min_max()
         arr = self._normalize_bound(arr, min_vals, max_vals)
         return arr[None, ...]
+
+
+class LoadTrackMapVideo(DataProcessingOperator):
+    def __init__(
+        self,
+        base_path="",
+        height=None,
+        width=None,
+        num_frames=81,
+        time_division_factor=4,
+        time_division_remainder=1,
+        num_points=256,
+        point_radius=6,
+        seed=42,
+        apply_noise=False,
+        noise_std=0.0,
+    ):
+        if height is None or width is None:
+            raise ValueError("`height` and `width` are required for track-map rendering.")
+        self.base_path = base_path
+        self.height = int(height)
+        self.width = int(width)
+        self.num_frames = int(num_frames)
+        self.time_division_factor = int(time_division_factor)
+        self.time_division_remainder = int(time_division_remainder)
+        self.num_points = int(num_points)
+        self.point_radius = int(point_radius)
+        self.seed = int(seed)
+        self.apply_noise = bool(apply_noise)
+        self.noise_std = float(noise_std)
+
+    def get_num_frames(self, total_frames):
+        num_frames = int(self.num_frames)
+        if int(total_frames) < num_frames:
+            num_frames = int(total_frames)
+            while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames -= 1
+        return num_frames
+
+    def _resolve_track_info(self, data, start_frame=None, end_frame=None, frame_indices=None):
+        payload = data
+        if isinstance(data, dict):
+            payload = data.get("data")
+            if start_frame is None:
+                start_frame = data.get("start_frame")
+            if end_frame is None:
+                end_frame = data.get("end_frame")
+            if frame_indices is None:
+                frame_indices = data.get("frame_indices")
+
+        if isinstance(payload, (list, tuple)):
+            entries = list(payload)
+        elif payload is None:
+            raise KeyError("Missing track path(s) in metadata 'data' field.")
+        else:
+            entries = [payload]
+        if len(entries) == 0:
+            raise ValueError("Empty track path list.")
+
+        resolved_entries = []
+        shared_start = start_frame
+        shared_end = end_frame
+        shared_frame_indices = frame_indices
+        for entry in entries:
+            if isinstance(entry, dict):
+                path = entry.get("data")
+                if shared_start is None:
+                    shared_start = entry.get("start_frame")
+                if shared_end is None:
+                    shared_end = entry.get("end_frame")
+                if shared_frame_indices is None:
+                    shared_frame_indices = entry.get("frame_indices")
+            else:
+                path = entry
+            if not path:
+                raise KeyError("Missing track path in track metadata.")
+            if not os.path.isabs(path):
+                path = os.path.join(self.base_path, path)
+            resolved_entries.append(path)
+
+        if shared_frame_indices is not None:
+            shared_frame_indices = [int(frame_id) for frame_id in shared_frame_indices]
+        else:
+            if shared_start is None or shared_end is None:
+                raise ValueError("Track rendering requires either frame_indices or start/end frame metadata.")
+            shared_start = int(shared_start)
+            shared_end = int(shared_end)
+        return resolved_entries, shared_start, shared_end, shared_frame_indices
+
+    def _select_frame_indices(self, total_frames, start_frame, end_frame, frame_indices):
+        max_frame_id = int(total_frames) - 1
+        if max_frame_id < 0:
+            raise ValueError("Track file contains no frames.")
+        if frame_indices is not None:
+            return [min(max(0, int(frame_id)), max_frame_id) for frame_id in frame_indices]
+
+        num_frames = self.get_num_frames(end_frame - start_frame + 1)
+        if num_frames <= 0:
+            raise ValueError("No track frames selected for rendering.")
+        stop = start_frame + num_frames
+        return [min(frame_id, max_frame_id) for frame_id in range(start_frame, stop)]
+
+    def _sample_visible_points(self, vis):
+        visible_point_indices = np.flatnonzero(np.any(vis, axis=0))
+        if visible_point_indices.size == 0:
+            raise ValueError("No visible points were found in this track view.")
+        sample_size = min(self.num_points, visible_point_indices.size)
+        return np.asarray(sampled := np.random.default_rng(self.seed).choice(visible_point_indices, size=sample_size, replace=False), dtype=np.int64)
+
+    @staticmethod
+    def _generate_distinct_colors(num_colors):
+        if num_colors <= 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+        colors = []
+        used = set()
+        golden_ratio = 0.6180339887498949
+        idx = 0
+        while len(colors) < num_colors:
+            hue = (idx * golden_ratio) % 1.0
+            saturation = 0.75 + 0.2 * ((idx % 3) / 2.0)
+            value = 0.85 + 0.15 * (((idx // 3) % 3) / 2.0)
+            rgb = tuple(int(round(channel * 255.0)) for channel in colorsys.hsv_to_rgb(hue, saturation, value))
+            if rgb not in used and max(rgb) >= 96:
+                used.add(rgb)
+                colors.append((rgb[2], rgb[1], rgb[0]))
+            idx += 1
+        return np.asarray(colors, dtype=np.uint8)
+
+    def _build_track_view(self, track_path, seed):
+        with np.load(track_path) as data:
+            tracks = np.asarray(data["tracks"], dtype=np.float32)
+            vis = np.asarray(data["vis"], dtype=bool)
+        if tracks.ndim != 3 or tracks.shape[-1] != 2:
+            raise ValueError(f"Unexpected tracks shape {tracks.shape} in {track_path}")
+        if vis.shape != tracks.shape[:2]:
+            raise ValueError(f"Unexpected vis shape {vis.shape} for tracks shape {tracks.shape} in {track_path}")
+        visible_point_indices = np.flatnonzero(np.any(vis, axis=0))
+        if visible_point_indices.size == 0:
+            raise ValueError(f"No visible points were found in {track_path}")
+        sample_size = min(self.num_points, visible_point_indices.size)
+        point_indices = np.asarray(
+            np.random.default_rng(seed).choice(visible_point_indices, size=sample_size, replace=False),
+            dtype=np.int64,
+        )
+        colors = self._generate_distinct_colors(len(point_indices))
+        noise_seed = int(seed) + 1000003
+        return tracks, vis, point_indices, colors, noise_seed
+
+    def _draw_point(self, canvas, x, y, color):
+        radius = self.point_radius
+        height, width = canvas.shape[:2]
+        x0 = max(0, x - radius)
+        x1 = min(width, x + radius + 1)
+        y0 = max(0, y - radius)
+        y1 = min(height, y + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        mask = (yy - y) ** 2 + (xx - x) ** 2 <= radius ** 2
+        patch = canvas[y0:y1, x0:x1]
+        patch[mask] = color
+
+    def _render_frame(self, tracks, vis, point_indices, colors, frame_id, noise_seed=None):
+        canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        frame_points = np.asarray(tracks[frame_id, point_indices], dtype=np.float32).copy()
+        frame_vis = vis[frame_id, point_indices]
+        valid = frame_vis & np.isfinite(frame_points).all(axis=1)
+        if not np.any(valid):
+            return canvas
+
+        if self.apply_noise and self.noise_std > 0:
+            noise_rng = np.random.default_rng(int(noise_seed) + int(frame_id) * 9973)
+            noise = noise_rng.normal(
+                loc=0.0,
+                scale=self.noise_std,
+                size=frame_points.shape,
+            ).astype(np.float32)
+            finite_mask = np.isfinite(frame_points).all(axis=1)
+            if np.any(finite_mask):
+                frame_points[finite_mask] = np.clip(frame_points[finite_mask] + noise[finite_mask], 0.0, 1.0)
+
+        pixel_x = np.rint(frame_points[:, 0] * (self.width - 1)).astype(np.int32)
+        pixel_y = np.rint(frame_points[:, 1] * (self.height - 1)).astype(np.int32)
+        valid &= pixel_x >= 0
+        valid &= pixel_x < self.width
+        valid &= pixel_y >= 0
+        valid &= pixel_y < self.height
+        for x, y, color in zip(pixel_x[valid], pixel_y[valid], colors[valid]):
+            self._draw_point(canvas, int(x), int(y), color)
+        return canvas
+
+    def __call__(self, data, start_frame=None, end_frame=None, frame_indices=None):
+        track_paths, start_frame, end_frame, frame_indices = self._resolve_track_info(
+            data, start_frame, end_frame, frame_indices
+        )
+
+        views = [self._build_track_view(track_path, self.seed + view_idx) for view_idx, track_path in enumerate(track_paths)]
+        total_frames = int(views[0][0].shape[0])
+        for tracks, vis, _, _, _ in views[1:]:
+            if int(tracks.shape[0]) != total_frames or vis.shape != views[0][1].shape:
+                raise ValueError("Mismatched track tensor shape across views.")
+
+        selected_frame_ids = self._select_frame_indices(total_frames, start_frame, end_frame, frame_indices)
+        rendered_views = []
+        for tracks, vis, point_indices, colors, noise_seed in views:
+            frames = []
+            for frame_id in selected_frame_ids:
+                frame = self._render_frame(
+                    tracks,
+                    vis,
+                    point_indices,
+                    colors,
+                    frame_id,
+                    noise_seed=noise_seed,
+                )
+                frames.append(torch.from_numpy(frame).permute(2, 0, 1).contiguous())
+            rendered_views.append(torch.stack(frames, dim=1).float())
+
+        video = torch.stack(rendered_views, dim=0)
+        video = video * (2.0 / 255.0) - 1.0
+        return video

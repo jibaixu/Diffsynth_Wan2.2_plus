@@ -61,7 +61,7 @@ def add_video_size_config(parser: argparse.ArgumentParser):
 def add_model_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "model")
     group.add_argument("--model_paths", type=str, default=None, help="Root path of the WAN pretrained weights.")
-    group.add_argument("--load_modules", type=str, default=None, help="Comma-separated modules to load: dit,text,vae,image,action. Supported variants: action:noise|adaln|cross|off, text:t5|emb|off, and image:flat|off. You can also set the default via env LOAD_MODULES.")
+    group.add_argument("--load_modules", type=str, default=None, help="Comma-separated modules to load: dit,text,vae,image,action,trackctx. Supported variants: action:noise|adaln|cross|off, text:t5|emb|off, image:flat|off, and trackctx|trackctx:off. You can also set the default via env LOAD_MODULES.")
     group.add_argument("--model_id_with_origin_paths", type=str, default=None, help="Model ID with origin paths, e.g., Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors. Comma-separated.")
     group.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     group.add_argument("--extra_inputs", default="input_image", help="Additional model inputs, comma-separated.")
@@ -123,6 +123,17 @@ def add_action_config(parser: argparse.ArgumentParser):
     group.add_argument("--action_stat_path", type=str, default=None, help="Path to action/state normalization stats (stat.json). Defaults to dataset_base_path/meta/stat.json if present.")
     return parser
 
+
+def add_track_context_config(parser: argparse.ArgumentParser):
+    group = _get_group(parser, "track")
+    group.add_argument("--track_num_points", type=int, default=256, help="Maximum number of visible track points sampled per view.")
+    group.add_argument("--track_point_radius", type=int, default=6, help="Rendered circle radius for each sampled track point.")
+    group.add_argument("--track_seed", type=int, default=42, help="Base random seed used for per-view track point sampling.")
+    group.add_argument("--track_apply_noise", type=int, choices=[0, 1], default=0, help="Apply small coordinate noise to track points before rendering track maps.")
+    group.add_argument("--track_noise_std", type=float, default=0.003, help="Standard deviation of the coordinate noise added in normalized track space.")
+    group.add_argument("--track_context_scale", type=float, default=1.0, help="Residual scale for track-context hint injection.")
+    return parser
+
 def add_infer_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "infer")
     group.add_argument("--ckpt_path", dest="checkpoint_path", type=str, default=None, help=("Path to checkpoint file or directory (optional; merged onto pretrained WAN weights). " "Supports checkpoints that include dit/action_encoder keys."))
@@ -144,4 +155,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
     parser = add_tracking_config(parser)
+    parser = add_track_context_config(parser)
     return parser

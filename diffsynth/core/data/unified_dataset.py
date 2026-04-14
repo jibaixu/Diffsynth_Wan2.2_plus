@@ -3,6 +3,15 @@ import os, torch, json, pandas, random
 
 
 class UnifiedDataset(torch.utils.data.Dataset):
+    RESERVED_METADATA_KEYS = {
+        "episode_index",
+        "length",
+        "raw_length",
+        "start_frame",
+        "end_frame",
+        "temporal_future_start",
+    }
+
     def __init__(
         self,
         base_path=None, metadata_path=None,
@@ -112,7 +121,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
     def _filter_metadata_keys(self):
         if self.load_from_cache or not self.data_file_keys:
             return
-        allowed_keys = set(self.data_file_keys)
+        allowed_keys = set(self.data_file_keys) | self.RESERVED_METADATA_KEYS
         for item in self.data:
             if not isinstance(item, dict):
                 continue
