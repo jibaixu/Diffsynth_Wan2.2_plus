@@ -3,6 +3,9 @@ from ..core import ModelConfig, load_state_dict
 from ..utils.controlnet import ControlNetInput
 from peft import LoraConfig, inject_adapter_in_model
 
+DEFAULT_LORA_TARGET_MODULES = ("q", "k", "v", "o", "ffn.0", "ffn.2")
+DEFAULT_LORA_RANK = 32
+
 
 class DiffusionTrainingModule(torch.nn.Module):
     def __init__(self):
@@ -26,7 +29,27 @@ class DiffusionTrainingModule(torch.nn.Module):
         return trainable_param_names
     
     
+    def _split_csv_arg(self, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
+
+
+    def _normalize_lora_base_model(self, value):
+        names = self._split_csv_arg(value)
+        if len(names) > 1:
+            raise ValueError(f"Only one LoRA base model is supported, got: {value}")
+        return names[0] if len(names) > 0 else None
+
+
     def add_lora_to_model(self, model, target_modules, lora_rank, lora_alpha=None, upcast_dtype=None):
+        target_modules = self._split_csv_arg(target_modules)
+        if len(target_modules) == 0:
+            target_modules = list(DEFAULT_LORA_TARGET_MODULES)
+        if lora_rank is None:
+            lora_rank = DEFAULT_LORA_RANK
         if lora_alpha is None:
             lora_alpha = lora_rank
         if isinstance(target_modules, list) and len(target_modules) == 1:
@@ -147,9 +170,11 @@ class DiffusionTrainingModule(torch.nn.Module):
     ):
         # Scheduler
         pipe.scheduler.set_timesteps(1000, training=True)
+        trainable_model_names = self._split_csv_arg(trainable_models)
+        lora_base_model = self._normalize_lora_base_model(lora_base_model)
         
         # Freeze untrainable models
-        pipe.freeze_except([] if trainable_models is None else trainable_models.split(","))
+        pipe.freeze_except(trainable_model_names)
         
         # Preset LoRA
         if preset_lora_path is not None:
@@ -166,7 +191,7 @@ class DiffusionTrainingModule(torch.nn.Module):
                 return
             model = self.add_lora_to_model(
                 getattr(pipe, lora_base_model),
-                target_modules=lora_target_modules.split(","),
+                target_modules=lora_target_modules,
                 lora_rank=lora_rank,
                 upcast_dtype=pipe.torch_dtype,
             )
@@ -203,8 +228,8 @@ class DiffusionTrainingModule(torch.nn.Module):
 
     def split_pipeline_units(self, task, pipe, trainable_models=None, lora_base_model=None):
         models_require_backward = []
-        if trainable_models is not None:
-            models_require_backward += trainable_models.split(",")
+        models_require_backward += self._split_csv_arg(trainable_models)
+        lora_base_model = self._normalize_lora_base_model(lora_base_model)
         if lora_base_model is not None:
             models_require_backward += [lora_base_model]
         if task.endswith(":data_process"):

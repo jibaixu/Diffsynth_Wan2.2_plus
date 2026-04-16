@@ -29,8 +29,12 @@ def debug_on():
         "--history_template_sampling", "0",
         "--track_apply_noise", "1",
         "--track_noise_std", "0.003",
+        "--track_context_scale", "0.1",
+        "--enable_dit_lora", "1",
+        "--lora_target_modules", "q,k,v,o,ffn.0,ffn.2",
+        "--lora_rank", "32",
     ]
-debug_on()
+# debug_on()
 
 import torch, os, argparse, accelerate, random, json
 import numpy as np
@@ -41,6 +45,9 @@ from diffsynth.pipelines.wan_video_spec import WanModuleSpec
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+DEFAULT_DIT_LORA_TARGET_MODULES = "q,k,v,o,ffn.0,ffn.2"
+DEFAULT_DIT_LORA_RANK = 32
+
 def set_global_seed(seed: int = 42) -> None:
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
     random.seed(seed)
@@ -48,6 +55,45 @@ def set_global_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def split_csv_arg(value):
+    if value is None:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def normalize_dit_lora_args(args):
+    lora_base_model = args.lora_base_model.strip() if isinstance(args.lora_base_model, str) else args.lora_base_model
+    if lora_base_model == "":
+        lora_base_model = None
+    if not args.lora_checkpoint:
+        args.lora_checkpoint = None
+
+    if bool(args.enable_dit_lora):
+        if lora_base_model not in (None, "dit"):
+            raise ValueError(f"--enable_dit_lora only supports LoRA on `dit`, got: {lora_base_model}")
+        lora_base_model = "dit"
+        if not args.lora_target_modules:
+            args.lora_target_modules = DEFAULT_DIT_LORA_TARGET_MODULES
+        if args.lora_rank is None:
+            args.lora_rank = DEFAULT_DIT_LORA_RANK
+
+    args.lora_base_model = lora_base_model
+    return args
+
+
+def resolve_trainable_models(trainable_models, action_enabled, track_context_enabled, enable_dit_lora=False):
+    models = split_csv_arg(trainable_models)
+    if len(models) == 0:
+        models = [] if enable_dit_lora else ["dit"]
+    if enable_dit_lora:
+        models = [model_name for model_name in models if model_name != "dit"]
+    if action_enabled and len(models) > 0 and "action_encoder" not in models and all(model_name == "dit" for model_name in models):
+        models.append("action_encoder")
+    if track_context_enabled and "track_context" not in models:
+        models.append("track_context")
+    return ",".join(models) if len(models) > 0 else None
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -183,6 +229,7 @@ if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
     set_global_seed(args.seed)
+    args = normalize_dit_lora_args(args)
     data_file_keys = [key.strip() for key in args.data_file_keys.split(",") if key.strip()]
     module_spec = WanModuleSpec.parse(args.load_modules)
     runtime = module_spec.build_runtime(args.model_paths, data_file_keys)
@@ -191,15 +238,13 @@ if __name__ == "__main__":
     action_enabled = runtime.action_enabled
     track_context_enabled = runtime.track_context_enabled
 
-    trainable_models = args.trainable_models
-    if not trainable_models:
-        trainable_models = "dit"
-    models = [m.strip() for m in str(trainable_models).split(",") if m.strip()]
-    if action_enabled and "action_encoder" not in models and all(m == "dit" for m in models):
-        models.append("action_encoder")
-    if track_context_enabled and "track_context" not in models:
-        models.append("track_context")
-    trainable_models = ",".join(models)
+    trainable_models = resolve_trainable_models(
+        args.trainable_models,
+        action_enabled=action_enabled,
+        track_context_enabled=track_context_enabled,
+        enable_dit_lora=bool(args.enable_dit_lora),
+    )
+    args.trainable_models = trainable_models
     model_paths_json = json.dumps(runtime.model_paths)
     tokenizer_path = runtime.tokenizer_path
     log_with = []

@@ -13,25 +13,11 @@ class TrackContextWanAttentionBlock(DiTBlock):
         num_heads,
         ffn_dim,
         eps=1e-6,
-        block_id=0,
     ):
         super().__init__(has_image_input, has_text_input, dim, num_heads, ffn_dim, eps=eps)
-        self.block_id = int(block_id)
-        if self.block_id == 0:
-            self.before_proj = nn.Linear(self.dim, self.dim)
-        self.after_proj = nn.Linear(self.dim, self.dim)
 
-    def forward(self, c, x, context, t_mod, freqs):
-        if self.block_id == 0:
-            c = self.before_proj(c) + x
-            all_c = []
-        else:
-            all_c = list(torch.unbind(c))
-            c = all_c.pop(-1)
-        c = super().forward(c, context, t_mod, freqs)
-        c_skip = self.after_proj(c)
-        all_c += [c_skip, c]
-        return torch.stack(all_c)
+    def forward(self, c, context, t_mod, freqs):
+        return super().forward(c, context, t_mod, freqs)
 
 
 class TrackContextWanModel(nn.Module):
@@ -60,10 +46,12 @@ class TrackContextWanModel(nn.Module):
                     num_heads=num_heads,
                     ffn_dim=ffn_dim,
                     eps=eps,
-                    block_id=layer_id,
                 )
                 for layer_id in self.track_layers
             ]
+        )
+        self.track_output_projs = nn.ModuleList(
+            [nn.Linear(dim, dim) for _ in self.track_layers]
         )
         self.track_patch_embedding = nn.Conv3d(
             self.track_in_dim,
@@ -74,7 +62,6 @@ class TrackContextWanModel(nn.Module):
 
     def forward(
         self,
-        x,
         track_context_latents,
         context,
         t_mod,
@@ -88,18 +75,8 @@ class TrackContextWanModel(nn.Module):
 
         c = [self.track_patch_embedding(latent.unsqueeze(0)) for latent in track_context_latents]
         c = [latent.flatten(2).transpose(1, 2) for latent in c]
-
-        aligned = []
-        for latent in c:
-            if latent.size(1) < x.shape[1]:
-                latent = torch.cat(
-                    [latent, latent.new_zeros(1, x.shape[1] - latent.size(1), latent.size(2))],
-                    dim=1,
-                )
-            elif latent.size(1) > x.shape[1]:
-                latent = latent[:, : x.shape[1]]
-            aligned.append(latent)
-        c = torch.cat(aligned, dim=0)
+        c = torch.cat(c, dim=0)
+        hints = []
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -114,7 +91,6 @@ class TrackContextWanModel(nn.Module):
                     c = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         c,
-                        x,
                         context,
                         t_mod,
                         freqs,
@@ -124,25 +100,21 @@ class TrackContextWanModel(nn.Module):
                 c = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     c,
-                    x,
                     context,
                     t_mod,
                     freqs,
                     use_reentrant=False,
-                )
+                    )
             else:
-                c = block(c, x, context, t_mod, freqs)
-        return torch.unbind(c)[:-1]
+                c = block(c, context, t_mod, freqs)
+            hints.append(self.track_output_projs[len(hints)](c))
+        return tuple(hints)
 
     def init_from_dit(self, dit: "WanModel", zero_init_extra: bool = True):
         from .wan_video_dit import WanModel
 
         if not isinstance(dit, WanModel):
             return
-
-        nn.init.zeros_(self.track_patch_embedding.weight)
-        if self.track_patch_embedding.bias is not None:
-            nn.init.zeros_(self.track_patch_embedding.bias)
 
         for track_idx, layer_id in enumerate(self.track_layers):
             if layer_id >= len(dit.blocks):
@@ -159,10 +131,7 @@ class TrackContextWanModel(nn.Module):
                     except Exception:
                         pass
             if zero_init_extra:
-                if hasattr(dst, "before_proj"):
-                    nn.init.zeros_(dst.before_proj.weight)
-                    if dst.before_proj.bias is not None:
-                        nn.init.zeros_(dst.before_proj.bias)
-                nn.init.zeros_(dst.after_proj.weight)
-                if dst.after_proj.bias is not None:
-                    nn.init.zeros_(dst.after_proj.bias)
+                proj = self.track_output_projs[track_idx]
+                nn.init.zeros_(proj.weight)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)

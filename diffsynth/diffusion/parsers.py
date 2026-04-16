@@ -94,9 +94,10 @@ def add_output_config(parser: argparse.ArgumentParser):
 
 def add_lora_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "lora")
+    group.add_argument("--enable_dit_lora", type=int, choices=[0, 1], default=0, help="Enable LoRA fine-tuning on DiT while keeping the base DiT weights frozen.")
     group.add_argument("--lora_base_model", type=str, default=None, help="Which model LoRA is added to.")
-    group.add_argument("--lora_target_modules", type=str, default=None, help="Which layers LoRA is added to (default: q,k,v,o,ffn.0,ffn.2).")
-    group.add_argument("--lora_rank", type=int, default=None, help="Rank of LoRA.")
+    group.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
+    group.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
     group.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
     group.add_argument("--preset_lora_path", type=str, default=None, help="Path to the preset LoRA checkpoint. If provided, this LoRA will be fused to the base model.")
     group.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
@@ -136,11 +137,13 @@ def add_track_context_config(parser: argparse.ArgumentParser):
 
 def add_infer_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "infer")
+    group.add_argument("--base_ckpt_path", dest="base_checkpoint_path", type=str, default=None, help=("Optional base checkpoint file or directory merged onto pretrained WAN weights before --ckpt_path. " "Use this when the experiment checkpoint is only a lightweight overlay, such as track_context-only training."))
     group.add_argument("--ckpt_path", dest="checkpoint_path", type=str, default=None, help=("Path to checkpoint file or directory (optional; merged onto pretrained WAN weights). " "Supports checkpoints that include dit/action_encoder keys."))
     group.add_argument("--metrics", type=str, choices=["core", "all"], default="core", help="Evaluation metric set: core=psnr,ssim,mse,lpips,fid,fvd; all=core plus PBench metrics.")
-    group.add_argument("--batch_videos", type=int, default=1, help="Number of comparison videos to preprocess per batch during core metric evaluation. Lower values reduce memory usage.")
+    group.add_argument("--batch_videos", type=int, default=1, help="Number of comparison videos to preprocess per evaluation batch. Lower values reduce peak memory usage for both core and all metrics modes.")
+    group.add_argument("--resume", type=int, choices=[0, 1], default=1, help="Resume generation by skipping existing comparison videos instead of overwriting them.")
     group.add_argument("--cfg_scale", type=float, default=5.0, help="CFG scale for generation")
-    group.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps.")
+    group.add_argument("--num_inference_steps", type=int, default=30, help="Number of inference steps.")
     group.add_argument("--negative_prompt", type=str, default=("The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion"), help="Negative prompt for generation")
     group.add_argument("--negative_prompt_emb", type=str, default=None, help="Path to the pre-extracted negative prompt embedding.")
     group.add_argument("--quality", type=int, default=5, help="Output video quality.")

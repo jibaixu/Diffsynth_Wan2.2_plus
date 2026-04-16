@@ -840,7 +840,6 @@ def model_fn_wan_video(
     track_hints = None
     if track_context is not None and track_context_latents is not None:
         track_hints = track_context(
-            x,
             track_context_latents,
             context,
             t_mod,

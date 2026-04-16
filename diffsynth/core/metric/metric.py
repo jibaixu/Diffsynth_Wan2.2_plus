@@ -348,91 +348,45 @@ def _write_image(image_path, frame):
     imageio.imwrite(image_path, frame)
 
 
-def _compute_pbench_metrics(prepared_samples, ctx: EvalContext):
-    with tempfile.TemporaryDirectory(prefix="pbench_chunk_eval_") as tmp_dir:
-        eval_root = os.path.join(tmp_dir, "video_quality")
-        videos_dir = os.path.join(eval_root, "videos")
-        images_dir = os.path.join(eval_root, "condition_images")
-        output_dir = os.path.join(eval_root, "evaluation_results")
-        os.makedirs(videos_dir, exist_ok=True)
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(output_dir, exist_ok=True)
-
-        prompt_entries = []
-        chunk_metadata = {}
-        chunk_idx = 0
-
-        for sample in tqdm(prepared_samples, desc="Preparing PBench chunks ...", leave=False):
-            if not sample.prompt:
-                raise RuntimeError(
-                    f"PBench metrics require prompt mapping for every sample, missing prompt for {sample.video_path}"
-                )
-            for start in range(0, sample.frames, ctx.frame_chunk_size):
-                pred_chunk = sample.pred_video[start:start + ctx.frame_chunk_size]
-                if pred_chunk.shape[0] != ctx.frame_chunk_size:
-                    continue
-                cond_frame = sample.gt_video[start]
-                sample_id = f"{sample.video_stem}_v{sample.view_index:02d}_c{chunk_idx:06d}"
-                video_out = os.path.join(videos_dir, f"{sample_id}.mp4")
-                image_out = os.path.join(images_dir, f"{sample_id}.jpg")
-                _write_mp4(video_out, pred_chunk)
-                _write_image(image_out, cond_frame)
-                chunk_metadata[sample_id] = {"view_name": sample.view_name}
-                prompt_entries.append(
-                    {
-                        "video_id": sample_id,
-                        "prompt": sample.prompt,
-                        "prompt_en": sample.prompt,
-                        "custom_image_path": image_out,
-                    }
-                )
-                chunk_idx += 1
-
-        if not prompt_entries:
-            raise RuntimeError("No valid chunks prepared for PBench metrics.")
-
-        prompt_file = os.path.join(eval_root, "prompts.json")
-        with open(prompt_file, "w", encoding="utf-8") as file_handle:
-            json.dump(prompt_entries, file_handle, indent=2, ensure_ascii=False)
-
-        try:
-            from .pbench import PBench
-        except ImportError:
-            from pbench import PBench
-
-        full_json_dir = os.path.join(os.path.dirname(__file__), "pbench", "VBench_full_info.json")
-        evaluator = PBench(ctx.device, full_json_dir, output_dir)
-
-        video_path_to_prompt = {f"{item['video_id']}.mp4": item for item in prompt_entries}
-        prev_force_single = os.environ.get("PBENCH_FORCE_SINGLE_PROCESS")
-        os.environ["PBENCH_FORCE_SINGLE_PROCESS"] = "1"
-        try:
-            evaluator.evaluate(
-                videos_path=videos_dir,
-                name="results_chunked",
-                prompt_list=video_path_to_prompt,
-                dimension_list=PBENCH_METRICS,
-                local=True,
-                read_frame=False,
-                mode="custom_input",
-                custom_image_folder=images_dir,
-                enable_missing_videos=True,
+def _append_pbench_chunks(
+    prepared_samples,
+    ctx: EvalContext,
+    *,
+    videos_dir: str,
+    images_dir: str,
+    chunk_metadata: dict,
+    prompt_entries: list,
+    chunk_idx: int,
+):
+    for sample in tqdm(prepared_samples, desc="Preparing PBench chunks ...", leave=False):
+        if not sample.prompt:
+            raise RuntimeError(
+                f"PBench metrics require prompt mapping for every sample, missing prompt for {sample.video_path}"
             )
-        finally:
-            if prev_force_single is None:
-                os.environ.pop("PBENCH_FORCE_SINGLE_PROCESS", None)
-            else:
-                os.environ["PBENCH_FORCE_SINGLE_PROCESS"] = prev_force_single
-        result_files = [
-            os.path.join(output_dir, filename)
-            for filename in os.listdir(output_dir)
-            if filename.startswith("results_") and filename.endswith("_eval_results.json")
-        ]
-        raw_results = {}
-        if result_files:
-            with open(max(result_files, key=os.path.getmtime), "r", encoding="utf-8") as file_handle:
-                raw_results = json.load(file_handle)
+        for start in range(0, sample.frames, ctx.frame_chunk_size):
+            pred_chunk = sample.pred_video[start:start + ctx.frame_chunk_size]
+            if pred_chunk.shape[0] != ctx.frame_chunk_size:
+                continue
+            cond_frame = sample.gt_video[start]
+            sample_id = f"{sample.video_stem}_v{sample.view_index:02d}_c{chunk_idx:06d}"
+            video_out = os.path.join(videos_dir, f"{sample_id}.mp4")
+            image_out = os.path.join(images_dir, f"{sample_id}.jpg")
+            _write_mp4(video_out, pred_chunk)
+            _write_image(image_out, cond_frame)
+            chunk_metadata[sample_id] = {"view_name": sample.view_name}
+            prompt_entries.append(
+                {
+                    "video_id": sample_id,
+                    "prompt": sample.prompt,
+                    "prompt_en": sample.prompt,
+                    "custom_image_path": image_out,
+                }
+            )
+            chunk_idx += 1
+    return chunk_idx
 
+
+def _parse_pbench_results(raw_results, chunk_metadata, ctx: EvalContext):
     parsed_results = {
         "overall": _empty_metric_values(PBENCH_METRICS),
         "views": {
@@ -479,6 +433,137 @@ def _compute_pbench_metrics(prepared_samples, ctx: EvalContext):
             parsed_results["overall"][metric_name] = overall_value
 
     return parsed_results
+
+
+def _run_pbench_evaluator(
+    ctx: EvalContext,
+    *,
+    eval_root: str,
+    videos_dir: str,
+    images_dir: str,
+    output_dir: str,
+    prompt_entries: list,
+    chunk_metadata: dict,
+):
+    if not prompt_entries:
+        raise RuntimeError("No valid chunks prepared for PBench metrics.")
+
+    prompt_file = os.path.join(eval_root, "prompts.json")
+    with open(prompt_file, "w", encoding="utf-8") as file_handle:
+        json.dump(prompt_entries, file_handle, indent=2, ensure_ascii=False)
+
+    try:
+        from .pbench import PBench
+    except ImportError:
+        from pbench import PBench
+
+    full_json_dir = os.path.join(os.path.dirname(__file__), "pbench", "VBench_full_info.json")
+    evaluator = PBench(ctx.device, full_json_dir, output_dir)
+
+    video_path_to_prompt = {f"{item['video_id']}.mp4": item for item in prompt_entries}
+    prev_force_single = os.environ.get("PBENCH_FORCE_SINGLE_PROCESS")
+    os.environ["PBENCH_FORCE_SINGLE_PROCESS"] = "1"
+    try:
+        evaluator.evaluate(
+            videos_path=videos_dir,
+            name="results_chunked",
+            prompt_list=video_path_to_prompt,
+            dimension_list=PBENCH_METRICS,
+            local=True,
+            read_frame=False,
+            mode="custom_input",
+            custom_image_folder=images_dir,
+            enable_missing_videos=True,
+        )
+    finally:
+        if prev_force_single is None:
+            os.environ.pop("PBENCH_FORCE_SINGLE_PROCESS", None)
+        else:
+            os.environ["PBENCH_FORCE_SINGLE_PROCESS"] = prev_force_single
+    result_files = [
+        os.path.join(output_dir, filename)
+        for filename in os.listdir(output_dir)
+        if filename.startswith("results_") and filename.endswith("_eval_results.json")
+    ]
+    raw_results = {}
+    if result_files:
+        with open(max(result_files, key=os.path.getmtime), "r", encoding="utf-8") as file_handle:
+            raw_results = json.load(file_handle)
+    return _parse_pbench_results(raw_results, chunk_metadata, ctx)
+
+
+def _compute_pbench_metrics(prepared_samples, ctx: EvalContext):
+    with tempfile.TemporaryDirectory(prefix="pbench_chunk_eval_") as tmp_dir:
+        eval_root = os.path.join(tmp_dir, "video_quality")
+        videos_dir = os.path.join(eval_root, "videos")
+        images_dir = os.path.join(eval_root, "condition_images")
+        output_dir = os.path.join(eval_root, "evaluation_results")
+        os.makedirs(videos_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        prompt_entries = []
+        chunk_metadata = {}
+        chunk_idx = 0
+
+        _append_pbench_chunks(
+            prepared_samples,
+            ctx,
+            videos_dir=videos_dir,
+            images_dir=images_dir,
+            chunk_metadata=chunk_metadata,
+            prompt_entries=prompt_entries,
+            chunk_idx=chunk_idx,
+        )
+        return _run_pbench_evaluator(
+            ctx,
+            eval_root=eval_root,
+            videos_dir=videos_dir,
+            images_dir=images_dir,
+            output_dir=output_dir,
+            prompt_entries=prompt_entries,
+            chunk_metadata=chunk_metadata,
+        )
+
+
+def _compute_pbench_metrics_streaming(ctx: EvalContext, batch_videos: int):
+    with tempfile.TemporaryDirectory(prefix="pbench_chunk_eval_") as tmp_dir:
+        eval_root = os.path.join(tmp_dir, "video_quality")
+        videos_dir = os.path.join(eval_root, "videos")
+        images_dir = os.path.join(eval_root, "condition_images")
+        output_dir = os.path.join(eval_root, "evaluation_results")
+        os.makedirs(videos_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        prompt_entries = []
+        chunk_metadata = {}
+        chunk_idx = 0
+        prepared_count = 0
+        for prepared_batch in _iter_prepared_sample_batches(ctx, batch_videos):
+            prepared_count += len(prepared_batch)
+            chunk_idx = _append_pbench_chunks(
+                prepared_batch,
+                ctx,
+                videos_dir=videos_dir,
+                images_dir=images_dir,
+                chunk_metadata=chunk_metadata,
+                prompt_entries=prompt_entries,
+                chunk_idx=chunk_idx,
+            )
+
+        if prepared_count <= 0:
+            raise RuntimeError("No valid view pairs found in comparison videos.")
+        tqdm.write(f"Prepared {prepared_count} view samples for PBench with batch_videos={batch_videos}.")
+        return _run_pbench_evaluator(
+            ctx,
+            eval_root=eval_root,
+            videos_dir=videos_dir,
+            images_dir=images_dir,
+            output_dir=output_dir,
+            prompt_entries=prompt_entries,
+            chunk_metadata=chunk_metadata,
+        )
 
 
 def _compute_stats(features):
@@ -778,7 +863,7 @@ def _print_evaluation_summary(metrics, view_metric_names, overall_metric_names):
     print("\n" + "=" * 60 + "\n")
 
 
-def _evaluate_core_streaming(ctx: EvalContext, batch_videos: int):
+def _evaluate_core_streaming(ctx: EvalContext, batch_videos: int, *, print_summary: bool = True):
     basic_totals, lpips_totals = _init_basic_totals(ctx.view_names)
     fid_gt_stats = RunningFeatureStats()
     fid_pred_stats = RunningFeatureStats()
@@ -830,7 +915,41 @@ def _evaluate_core_streaming(ctx: EvalContext, batch_videos: int):
         },
         "views": basic_metrics["views"],
     }
-    _print_evaluation_summary(metrics, CORE_VIEW_METRICS, CORE_OVERALL_METRICS)
+    if print_summary:
+        _print_evaluation_summary(metrics, CORE_VIEW_METRICS, CORE_OVERALL_METRICS)
+    return metrics
+
+
+def _evaluate_all_streaming(ctx: EvalContext, batch_videos: int):
+    core_metrics = _evaluate_core_streaming(ctx, batch_videos=batch_videos, print_summary=False)
+    pbench_metrics = _compute_pbench_metrics_streaming(ctx, batch_videos=batch_videos)
+    _print_stage_overall_metrics("PBENCH METRICS READY", PBENCH_METRICS, pbench_metrics["overall"])
+
+    metrics = {
+        "overall": _empty_metric_values(ALL_OVERALL_METRICS),
+        "views": {
+            view_name: {
+                **_empty_metric_values(ALL_VIEW_METRICS),
+                "frames": 0,
+            }
+            for view_name in ctx.view_names
+        },
+    }
+
+    for metric_name, value in core_metrics.get("overall", {}).items():
+        metrics["overall"][metric_name] = float(value)
+    for metric_name, value in pbench_metrics.get("overall", {}).items():
+        metrics["overall"][metric_name] = float(value)
+
+    for view_name in ctx.view_names:
+        core_view_metrics = core_metrics.get("views", {}).get(view_name, {})
+        pbench_view_metrics = pbench_metrics.get("views", {}).get(view_name, {})
+        for metric_name, value in core_view_metrics.items():
+            metrics["views"][view_name][metric_name] = int(value) if metric_name == "frames" else float(value)
+        for metric_name, value in pbench_view_metrics.items():
+            metrics["views"][view_name][metric_name] = float(value)
+
+    _print_evaluation_summary(metrics, ALL_VIEW_METRICS, ALL_OVERALL_METRICS)
     return metrics
 
 
@@ -881,7 +1000,7 @@ def evaluate(
         num_workers (int): Number of worker threads for PSNR/SSIM.
         num_views (int): Number of camera views in each comparison video.
         frame_chunk_size (int): Frames per chunk; tail frames that do not make a full chunk are dropped.
-        batch_videos (int): Number of comparison videos to preprocess per batch in core metrics mode.
+        batch_videos (int): Number of comparison videos to preprocess per evaluation batch.
         metrics (str): Metric preset. "core" runs psnr/ssim/mse/lpips/fid/fvd; "all" also runs PBench metrics.
         sample_records (list[dict]|None): In-memory prompt and output-video records from inference.
 
@@ -946,11 +1065,7 @@ def evaluate(
     metrics_mode = _resolve_metric_selection(metrics)["mode"]
     if metrics_mode == "core":
         return _evaluate_core_streaming(ctx, batch_videos=batch_videos)
-
-    tqdm.write("`batch_videos` currently applies to core metrics only; metrics='all' still preloads videos for PBench.")
-    prepared_samples = _prepare_samples(ctx)
-    print(f"Prepared {len(prepared_samples)} view samples.")
-    return _evaluate_video_group(ctx, prepared_samples, metrics=metrics)
+    return _evaluate_all_streaming(ctx, batch_videos=batch_videos)
 
 
 def evaluate_and_write_report(
@@ -1023,7 +1138,7 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=64, help='Number of worker threads for PSNR/SSIM')
     parser.add_argument('--num_views', type=int, default=3, help='Number of views in each comparison video')
     parser.add_argument('--frame_chunk_size', type=int, default=81, help='Frames per metric chunk; drop final incomplete chunk')
-    parser.add_argument('--batch_videos', type=int, default=1, help='Number of comparison videos to preprocess per batch in core metrics mode')
+    parser.add_argument('--batch_videos', type=int, default=1, help='Number of comparison videos to preprocess per evaluation batch')
 
     args = parser.parse_args()
 

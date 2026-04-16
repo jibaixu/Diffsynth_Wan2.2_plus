@@ -12,14 +12,45 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
+from peft import LoraConfig, inject_adapter_in_model
 
-from diffsynth.core import load_wan_checkpoint_into_pipeline
+from diffsynth.core import load_state_dict
+from diffsynth.core.loader.file import load_keys_dict
 from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
 from diffsynth.pipelines.wan_video_spec import WanModuleSpec, WanRuntimeConfig
 from diffsynth.utils.data import save_video
 
 
 _TORCHRUN_ENV_KEYS = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+_ACTION_PREFIX = "pipe.action_encoder."
+_TRACK_CONTEXT_PREFIX = "pipe.track_context."
+_UNSUPPORTED_PREFIXES = ("action_encoder.", "dit.")
+_DIT_LORA_PREFIXES = ("pipe.dit.", "dit.")
+_LORA_STATE_KEY_SUFFIXES = (
+    "lora_A.weight",
+    "lora_B.weight",
+    "lora_A.default.weight",
+    "lora_B.default.weight",
+)
+DEFAULT_DIT_LORA_TARGET_MODULES = ("q", "k", "v", "o", "ffn.0", "ffn.2")
+DEFAULT_DIT_LORA_RANK = 32
+
+
+@dataclass(frozen=True)
+class CheckpointOverlaySummary:
+    dit_key_count: int = 0
+    dit_lora_key_count: int = 0
+    action_key_count: int = 0
+    track_context_key_count: int = 0
+
+    @property
+    def is_track_context_only(self) -> bool:
+        return (
+            self.track_context_key_count > 0
+            and self.dit_key_count == 0
+            and self.dit_lora_key_count == 0
+            and self.action_key_count == 0
+        )
 
 
 def resolve_optional_path(path_value, base_dir: str):
@@ -59,8 +90,49 @@ def load_flat_config_defaults(ckpt_path: Optional[str]) -> Dict[str, Any]:
     if not grouped_config:
         return {}
     if any(isinstance(value, dict) for value in grouped_config.values()):
-        return flatten_grouped_config(grouped_config)
+        grouped_config = flatten_grouped_config(grouped_config)
+    if "base_ckpt_path" in grouped_config and "base_checkpoint_path" not in grouped_config:
+        grouped_config["base_checkpoint_path"] = grouped_config["base_ckpt_path"]
     return grouped_config
+
+
+def _split_csv_arg(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _is_lora_state_key(key: str) -> bool:
+    return key.endswith(_LORA_STATE_KEY_SUFFIXES)
+
+
+def _normalize_dit_lora_key(key: str) -> str:
+    for prefix in _DIT_LORA_PREFIXES:
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+    return key.replace("lora_A.weight", "lora_A.default.weight").replace("lora_B.weight", "lora_B.default.weight")
+
+
+def _classify_checkpoint_key(
+    key: str,
+    dit_key_filter=None,
+) -> tuple[str, Optional[str]]:
+    if key.startswith(_ACTION_PREFIX):
+        return "action_encoder", key[len(_ACTION_PREFIX):]
+    if key.startswith(_TRACK_CONTEXT_PREFIX):
+        return "track_context", key[len(_TRACK_CONTEXT_PREFIX):]
+    if _is_lora_state_key(key):
+        return "dit_lora", _normalize_dit_lora_key(key)
+    if key.startswith(_UNSUPPORTED_PREFIXES):
+        return "ignore", None
+    if key.startswith("pipe."):
+        return "ignore", None
+    if dit_key_filter is not None and not dit_key_filter(key):
+        return "skip", None
+    return "dit", key
 
 
 @dataclass(frozen=True)
@@ -180,6 +252,8 @@ def build_wan_inference_config(
     data_file_keys=None,
 ) -> "WanInferenceConfig":
     merged_values = dict(values)
+    if "base_ckpt_path" in merged_values and "base_checkpoint_path" not in merged_values:
+        merged_values["base_checkpoint_path"] = merged_values["base_ckpt_path"]
     runtime = WanModuleSpec.parse(merged_values.get("load_modules")).build_runtime(
         merged_values.get("model_paths"),
         _normalize_data_file_keys(
@@ -404,6 +478,10 @@ class CheckpointPipelineManager:
         if self.verbose:
             self.logger.info(message, *args)
 
+    def _warning(self, message: str, *args) -> None:
+        if self.verbose:
+            self.logger.warning(message, *args)
+
     @staticmethod
     def _is_vram_managed_module(module) -> bool:
         return bool(getattr(module, "vram_management_enabled", False))
@@ -426,10 +504,84 @@ class CheckpointPipelineManager:
         self._info("  - %s", ckpt_path.name)
         return [ckpt_path]
 
+    def _resolve_base_checkpoint(self) -> Optional[Path]:
+        base_checkpoint_path = self.config.values.get("base_checkpoint_path")
+        if not base_checkpoint_path:
+            base_checkpoint_path = self.config.values.get("base_ckpt_path")
+        if not base_checkpoint_path:
+            return None
+        return Path(str(base_checkpoint_path))
+
+    def _summarize_checkpoint_overlay(self, checkpoint: Path) -> CheckpointOverlaySummary:
+        summary = CheckpointOverlaySummary()
+        for key in load_keys_dict(os.fspath(checkpoint)):
+            target, _ = _classify_checkpoint_key(key)
+            if target == "dit":
+                summary = CheckpointOverlaySummary(
+                    dit_key_count=summary.dit_key_count + 1,
+                    dit_lora_key_count=summary.dit_lora_key_count,
+                    action_key_count=summary.action_key_count,
+                    track_context_key_count=summary.track_context_key_count,
+                )
+            elif target == "dit_lora":
+                summary = CheckpointOverlaySummary(
+                    dit_key_count=summary.dit_key_count,
+                    dit_lora_key_count=summary.dit_lora_key_count + 1,
+                    action_key_count=summary.action_key_count,
+                    track_context_key_count=summary.track_context_key_count,
+                )
+            elif target == "action_encoder":
+                summary = CheckpointOverlaySummary(
+                    dit_key_count=summary.dit_key_count,
+                    dit_lora_key_count=summary.dit_lora_key_count,
+                    action_key_count=summary.action_key_count + 1,
+                    track_context_key_count=summary.track_context_key_count,
+                )
+            elif target == "track_context":
+                summary = CheckpointOverlaySummary(
+                    dit_key_count=summary.dit_key_count,
+                    dit_lora_key_count=summary.dit_lora_key_count,
+                    action_key_count=summary.action_key_count,
+                    track_context_key_count=summary.track_context_key_count + 1,
+                )
+        return summary
+
+    def _warn_if_missing_base_checkpoint(self, checkpoints: List[Path]) -> None:
+        if self._resolve_base_checkpoint() is not None or len(checkpoints) == 0:
+            return
+        checkpoint = Path(checkpoints[0])
+        checkpoint_summary = self._summarize_checkpoint_overlay(checkpoint)
+        if not checkpoint_summary.is_track_context_only:
+            return
+
+        checkpoint_defaults = load_flat_config_defaults(os.fspath(checkpoint))
+        trainable_models = set(_split_csv_arg(checkpoint_defaults.get("trainable_models")))
+        if trainable_models not in (set(), {"track_context"}):
+            return
+
+        self._warning(
+            "Checkpoint %s contains only track_context weights (%s keys) and no DiT/action/LoRA weights. "
+            "If it was trained as an overlay on a robot base checkpoint, pass --base_ckpt_path so inference "
+            "loads that base before applying this checkpoint.",
+            checkpoint,
+            checkpoint_summary.track_context_key_count,
+        )
+
     def initialize_pipeline(self, checkpoints: List[Path]) -> WanVideoPipeline:
+        base_checkpoint = self._resolve_base_checkpoint()
+        self._warn_if_missing_base_checkpoint(checkpoints)
         if checkpoints:
             first_ckpt = checkpoints[0]
-            self._info("Using pretrained WAN weights; will apply checkpoint: %s", first_ckpt)
+            if base_checkpoint is not None:
+                self._info(
+                    "Using pretrained WAN weights; will apply base checkpoint %s before checkpoint %s",
+                    base_checkpoint,
+                    first_ckpt,
+                )
+            else:
+                self._info("Using pretrained WAN weights; will apply checkpoint: %s", first_ckpt)
+        elif base_checkpoint is not None:
+            self._info("Using pretrained WAN weights; will apply base checkpoint: %s", base_checkpoint)
         else:
             self._info("Using pretrained WAN weights only (no checkpoint overlay).")
         self.pipeline = WanVideoPipeline.from_pretrained(
@@ -439,6 +591,11 @@ class CheckpointPipelineManager:
             tokenizer_config=self.config.build_tokenizer_config(),
             modules=list(self.config.modules)
         )
+        self._apply_preset_lora()
+        self._configure_dit_lora()
+        if base_checkpoint is not None:
+            self._load_checkpoint_overlay(base_checkpoint, overlay_name="base checkpoint")
+            self._info("")
         self._info("Pipeline initialized successfully!\n")
         return self.pipeline
 
@@ -448,15 +605,186 @@ class CheckpointPipelineManager:
         if checkpoint is None:
             self._info("No checkpoint provided; skipping overlay update.")
             return
-        load_wan_checkpoint_into_pipeline(
-            self.pipeline,
-            checkpoint,
-            torch_dtype=torch.bfloat16,
-            device="cpu",
-            logger=self.logger if self.verbose else None,
-            message_prefix="Updating checkpoint weights",
-        )
+        self._load_checkpoint_overlay(checkpoint)
         self._info("")
+
+    def _lora_enabled(self) -> bool:
+        return bool(int(getattr(self.config, "enable_dit_lora", 0)))
+
+    def _get_dit_module(self):
+        if self.pipeline is None:
+            raise RuntimeError("Pipeline is not initialized")
+        dit = getattr(self.pipeline, "dit", None)
+        if dit is None:
+            raise ValueError("DiT LoRA inference requires `pipeline.dit`, but the current pipeline has no DiT module.")
+        return dit
+
+    def _apply_preset_lora(self) -> None:
+        if self.pipeline is None:
+            raise RuntimeError("Pipeline is not initialized")
+        preset_lora_path = getattr(self.config, "preset_lora_path", None)
+        if not preset_lora_path:
+            return
+        preset_lora_model = getattr(self.config, "preset_lora_model", None)
+        if not preset_lora_model:
+            raise ValueError("`--preset_lora_path` requires `--preset_lora_model`.")
+        module = getattr(self.pipeline, preset_lora_model, None)
+        if module is None:
+            raise ValueError(f"`--preset_lora_model {preset_lora_model}` is not available in the inference pipeline.")
+        self._info("Fusing preset LoRA into %s from %s", preset_lora_model, preset_lora_path)
+        self.pipeline.load_lora(module, preset_lora_path)
+
+    def _configure_dit_lora(self) -> None:
+        if self.pipeline is None or not self._lora_enabled():
+            return
+        lora_base_model = getattr(self.config, "lora_base_model", None)
+        if lora_base_model not in (None, "dit"):
+            raise ValueError(f"Inference only supports `--lora_base_model dit`, got: {lora_base_model}")
+
+        target_modules = _split_csv_arg(getattr(self.config, "lora_target_modules", None))
+        if not target_modules:
+            target_modules = list(DEFAULT_DIT_LORA_TARGET_MODULES)
+        lora_rank = int(getattr(self.config, "lora_rank", DEFAULT_DIT_LORA_RANK) or DEFAULT_DIT_LORA_RANK)
+        lora_target_value = target_modules[0] if len(target_modules) == 1 else target_modules
+
+        dit = self._get_dit_module()
+        lora_config = LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules=lora_target_value)
+        dit = inject_adapter_in_model(lora_config, dit)
+        torch_dtype = getattr(self.pipeline, "torch_dtype", None)
+        if torch_dtype is not None:
+            for param in dit.parameters():
+                if param.requires_grad:
+                    param.data = param.data.to(dtype=torch_dtype)
+        setattr(self.pipeline, "dit", dit)
+        self._info(
+            "Enabled DiT LoRA for inference: target_modules=%s, rank=%s",
+            ",".join(target_modules),
+            lora_rank,
+        )
+
+        lora_checkpoint = getattr(self.config, "lora_checkpoint", None)
+        if lora_checkpoint:
+            self._load_explicit_lora_checkpoint(Path(lora_checkpoint))
+
+    def _load_component_state(self, name: str, module, state_dict: Dict[str, torch.Tensor]) -> None:
+        if not state_dict:
+            return
+        if module is None:
+            self._warning("  - %s weights found (%s keys), but pipeline.%s is None", name, len(state_dict), name)
+            return
+        load_result = module.load_state_dict(state_dict, strict=False)
+        self._info(
+            "  - Loaded %s keys: %s (missing=%s, unexpected=%s)",
+            name,
+            len(state_dict),
+            len(load_result.missing_keys),
+            len(load_result.unexpected_keys),
+        )
+
+    def _load_dit_lora_state(self, state_dict: Dict[str, torch.Tensor], *, source_label: str) -> int:
+        if not state_dict:
+            return 0
+        if not self._lora_enabled():
+            self._warning(
+                "  - Ignored %s DiT LoRA keys from %s because --enable_dit_lora=0",
+                len(state_dict),
+                source_label,
+            )
+            return 0
+        dit = self._get_dit_module()
+        load_result = dit.load_state_dict(state_dict, strict=False)
+        self._info(
+            "  - Loaded dit LoRA keys from %s: %s (unexpected=%s)",
+            source_label,
+            len(state_dict),
+            len(load_result.unexpected_keys),
+        )
+        if len(load_result.unexpected_keys) > 0:
+            self._warning(
+                "  - DiT LoRA checkpoint %s has %s unexpected keys",
+                source_label,
+                len(load_result.unexpected_keys),
+            )
+        return len(state_dict)
+
+    def _load_explicit_lora_checkpoint(self, checkpoint_path: Path) -> None:
+        if self.pipeline is None:
+            raise RuntimeError("Pipeline is not initialized")
+        self._info("Loading explicit DiT LoRA checkpoint: %s", checkpoint_path)
+        lora_state = load_state_dict(
+            os.fspath(checkpoint_path),
+            torch_dtype=getattr(self.pipeline, "torch_dtype", None),
+            device="cpu",
+            key_filter=_is_lora_state_key,
+        )
+        normalized_lora_state = {
+            _normalize_dit_lora_key(key): value
+            for key, value in lora_state.items()
+            if _is_lora_state_key(key)
+        }
+        if not normalized_lora_state:
+            self._warning("  - No DiT LoRA keys found in explicit checkpoint: %s", checkpoint_path)
+            return
+        self._load_dit_lora_state(normalized_lora_state, source_label=str(checkpoint_path))
+
+    def _load_checkpoint_overlay(self, checkpoint: Path, *, overlay_name: str = "checkpoint") -> CheckpointOverlaySummary:
+        if self.pipeline is None:
+            raise RuntimeError("Pipeline is not initialized")
+        checkpoint = Path(checkpoint)
+        checkpoint_path = os.fspath(checkpoint)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+
+        self._info("Updating %s weights: %s", overlay_name, checkpoint_path)
+        dit = getattr(self.pipeline, "dit", None)
+        dit_key_filter = getattr(dit, "should_load_state_dict_key", None)
+        dit_key_filter = dit_key_filter if callable(dit_key_filter) else None
+
+        ignored_key_count = sum(
+            1
+            for key in load_keys_dict(checkpoint_path)
+            if _classify_checkpoint_key(key)[0] == "ignore"
+        )
+
+        def keep_checkpoint_key(key: str) -> bool:
+            target, _ = _classify_checkpoint_key(key, dit_key_filter)
+            return target in ("dit", "action_encoder", "track_context", "dit_lora")
+
+        state_dict = load_state_dict(
+            checkpoint_path,
+            torch_dtype=getattr(self.pipeline, "torch_dtype", None),
+            device="cpu",
+            key_filter=keep_checkpoint_key,
+        )
+
+        dit_state: Dict[str, torch.Tensor] = {}
+        dit_lora_state: Dict[str, torch.Tensor] = {}
+        action_state: Dict[str, torch.Tensor] = {}
+        track_context_state: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            target, normalized_key = _classify_checkpoint_key(key, dit_key_filter)
+            if target == "dit":
+                dit_state[normalized_key] = value
+            elif target == "dit_lora":
+                dit_lora_state[normalized_key] = value
+            elif target == "action_encoder":
+                action_state[normalized_key] = value
+            elif target == "track_context":
+                track_context_state[normalized_key] = value
+
+        self._load_component_state("dit", getattr(self.pipeline, "dit", None), dit_state)
+        self._load_dit_lora_state(dit_lora_state, source_label=checkpoint.name)
+        self._load_component_state("action_encoder", getattr(self.pipeline, "action_encoder", None), action_state)
+        self._load_component_state("track_context", getattr(self.pipeline, "track_context", None), track_context_state)
+
+        if ignored_key_count > 0:
+            self._info("  - Ignored %s keys with unsupported checkpoint prefixes", ignored_key_count)
+        return CheckpointOverlaySummary(
+            dit_key_count=len(dit_state),
+            dit_lora_key_count=len(dit_lora_state),
+            action_key_count=len(action_state),
+            track_context_key_count=len(track_context_state),
+        )
 
     def prepare_generation_models(self) -> None:
         if self.pipeline is None:
