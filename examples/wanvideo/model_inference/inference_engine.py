@@ -106,8 +106,11 @@ class InferenceEngine:
     def run(self) -> None:
         try:
             self._prepare()
-            with suppress_stdout_if(not self._is_main_process()):
-                self.pipeline = self.pipeline_manager.initialize_pipeline(self.checkpoints)
+            if self._should_generate():
+                with suppress_stdout_if(not self._is_main_process()):
+                    self.pipeline = self.pipeline_manager.initialize_pipeline(self.checkpoints)
+            elif self._is_main_process():
+                self.logger.info("Skipping generation model initialization because run_mode=%s", self._run_mode())
 
             checkpoints_to_run: List[Optional[Path]] = self.checkpoints if self.checkpoints else [None]
             self.total_checkpoint_runs = len(checkpoints_to_run)
@@ -125,18 +128,28 @@ class InferenceEngine:
             raise
 
     def _prepare(self) -> None:
-        self._load_dataset()
-        all_sample_indices = list(range(len(self.dataset)))
-        self.sample_indices = all_sample_indices[self.dist_context.rank :: self.dist_context.world_size]
         self.checkpoints = self.pipeline_manager.discover_checkpoints()
+        if self._should_generate():
+            self._load_dataset()
+            all_sample_indices = list(range(len(self.dataset)))
+            self.sample_indices = all_sample_indices[self.dist_context.rank :: self.dist_context.world_size]
+        else:
+            self.sample_indices = []
 
         if self._is_main_process():
-            self.logger.info("Total samples: %s", len(self.dataset))
+            self.logger.info("Run mode: %s", self._run_mode())
+            if self.dataset is not None:
+                self.logger.info("Total samples: %s", len(self.dataset))
+            else:
+                self.logger.info("Dataset loading: skipped")
             if self.checkpoints:
                 self.logger.info("Checkpoints to process: %s", len(self.checkpoints))
             else:
                 self.logger.info("Checkpoints to process: pretrained-only (1 run)")
-            self.logger.info("Resume generation: %s", "enabled" if self._resume_enabled() else "disabled")
+            if self._should_generate():
+                self.logger.info("Resume generation: %s", "enabled" if self._resume_enabled() else "disabled")
+            else:
+                self.logger.info("Resume generation: skipped")
             self.logger.info("")
 
     def _use_autoregressive_history_template_mode(self) -> bool:
@@ -200,6 +213,23 @@ class InferenceEngine:
     def _diagnostic_export_track_videos(self) -> bool:
         return self._diagnose_inference() and bool(int(getattr(self.config, "diagnostic_export_track_videos", 1)))
 
+    def _run_mode(self) -> str:
+        return str(getattr(self.config, "run_mode", "all")).strip().lower()
+
+    def _should_generate(self) -> bool:
+        return self._run_mode() in ("infer", "all")
+
+    def _should_evaluate(self) -> bool:
+        return self._run_mode() in ("metrics", "all")
+
+    def _completion_banner(self) -> str:
+        run_mode = self._run_mode()
+        if run_mode == "infer":
+            return "VIDEO GENERATION COMPLETED"
+        if run_mode == "metrics":
+            return "METRIC EVALUATION COMPLETED"
+        return "VIDEO GENERATION AND EVALUATION COMPLETED"
+
     def _process_checkpoint(
         self,
         checkpoint: Optional[Path],
@@ -215,23 +245,33 @@ class InferenceEngine:
                 total_checkpoints,
                 checkpoint_name,
             )
+            self.logger.info("Execution mode: %s", self._run_mode())
             self.logger.info("%s\n", "#" * 80)
 
-        with suppress_stdout_if(not self._is_main_process()):
-            self.pipeline_manager.update_checkpoint(checkpoint)
-            self.pipeline_manager.prepare_generation_models()
-        output_dirs = self._create_output_dirs(checkpoint)
-        self.generated_sample_records = []
-        self._generate_all_videos(output_dirs, ckpt_idx)
-        merged_sample_records = self._finalize_sample_records(output_dirs["root"])
-        barrier(self.dist_context)
-        with suppress_stdout_if(not self._is_main_process()):
-            self.pipeline_manager.release_generation_models()
-        barrier(self.dist_context)
+        if self._should_generate():
+            with suppress_stdout_if(not self._is_main_process()):
+                self.pipeline_manager.update_checkpoint(checkpoint)
+                self.pipeline_manager.prepare_generation_models()
+        output_dirs = self._create_output_dirs(
+            checkpoint,
+            require_existing=not self._should_generate(),
+            save_config=self._should_generate(),
+        )
+        if self._should_generate():
+            self.generated_sample_records = []
+            self._generate_all_videos(output_dirs, ckpt_idx)
+            merged_sample_records = self._finalize_sample_records(output_dirs["root"])
+            barrier(self.dist_context)
+            with suppress_stdout_if(not self._is_main_process()):
+                self.pipeline_manager.release_generation_models()
+            barrier(self.dist_context)
+        else:
+            merged_sample_records = self._load_existing_sample_records(output_dirs["root"])
+            barrier(self.dist_context)
 
         metrics_report = None
         metrics_output_path = output_dirs["root"] / "metrics.json"
-        if self.dist_context.is_main_process:
+        if self._should_evaluate() and self.dist_context.is_main_process:
             metrics_report = self._evaluate_generated_outputs(
                 output_root=output_dirs["root"],
                 checkpoint_name=checkpoint_name,
@@ -242,10 +282,13 @@ class InferenceEngine:
 
         if self.dist_context.is_main_process:
             self.logger.info("\n%s", "=" * 60)
-            self.logger.info("VIDEO GENERATION COMPLETED")
+            self.logger.info(self._completion_banner())
             self.logger.info("%s", "=" * 60)
             self.logger.info("Total videos: %s", len(merged_sample_records))
-            self.logger.info("Metrics report: %s", metrics_output_path.resolve())
+            if metrics_report is not None:
+                self.logger.info("Metrics report: %s", metrics_output_path.resolve())
+            else:
+                self.logger.info("Metrics evaluation: skipped")
             self.logger.info("%s\n", "=" * 60)
         summary = {
             "checkpoint": checkpoint_name,
@@ -296,7 +339,13 @@ class InferenceEngine:
         self.logger.info("Saved metrics report: %s", metrics_output_path.resolve())
         return report
 
-    def _create_output_dirs(self, checkpoint: Optional[Path]) -> Dict[str, Path]:
+    def _create_output_dirs(
+        self,
+        checkpoint: Optional[Path],
+        *,
+        require_existing: bool = False,
+        save_config: bool = True,
+    ) -> Dict[str, Path]:
         output_dir_value = None
         if self.dist_context.is_main_process:
             if checkpoint is None:
@@ -304,17 +353,59 @@ class InferenceEngine:
             else:
                 output_dir_value = str(checkpoint.parent)
         output_dir = Path(broadcast_object(self.dist_context, output_dir_value))
-        output_dir.mkdir(parents=True, exist_ok=True)
         videos_dir = output_dir / "videos"
-        videos_dir.mkdir(parents=True, exist_ok=True)
         diagnostics_dir = output_dir / "diagnostics"
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        if self.dist_context.is_main_process:
+        if require_existing:
+            if not output_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Output directory not found for metrics-only evaluation: {output_dir.resolve()}. "
+                    "Run with run_mode=infer or run_mode=all first."
+                )
+            if not videos_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Videos directory not found for metrics-only evaluation: {videos_dir.resolve()}. "
+                    "Run with run_mode=infer or run_mode=all first."
+                )
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        if self.dist_context.is_main_process and save_config:
             self._save_config(output_dir)
         barrier(self.dist_context)
         if self._is_main_process():
             self.logger.info("Output directory: %s\n", output_dir.resolve())
         return {"root": output_dir, "videos": videos_dir, "diagnostics": diagnostics_dir}
+
+    def _load_existing_sample_records(self, output_dir: Path) -> List[Dict]:
+        records_path = merged_sample_records_path(output_dir)
+        videos_dir = Path(output_dir) / "videos"
+        if not records_path.is_file():
+            raise FileNotFoundError(
+                f"Sample records not found for metrics-only evaluation: {records_path.resolve()}. "
+                "Run with run_mode=infer or run_mode=all first."
+            )
+        if not any(videos_dir.iterdir()):
+            raise RuntimeError(
+                f"No generated videos found for metrics-only evaluation in {videos_dir.resolve()}. "
+                "Run with run_mode=infer or run_mode=all first."
+            )
+
+        records: List[Dict] = []
+        with records_path.open("r", encoding="utf-8") as file_handle:
+            for line in file_handle:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        if not records:
+            raise RuntimeError(
+                f"No sample records found in {records_path.resolve()} for metrics-only evaluation. "
+                "Run with run_mode=infer or run_mode=all first."
+            )
+        if self._is_main_process():
+            self.logger.info("Loaded %s sample records from %s", len(records), records_path.resolve())
+        return records
 
     def _save_config(self, output_dir: Path) -> None:
         config_path = output_dir / "config.json"

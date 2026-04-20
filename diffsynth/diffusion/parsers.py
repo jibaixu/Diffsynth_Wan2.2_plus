@@ -139,6 +139,7 @@ def add_infer_config(parser: argparse.ArgumentParser):
     group = _get_group(parser, "infer")
     group.add_argument("--base_ckpt_path", dest="base_checkpoint_path", type=str, default=None, help=("Optional base checkpoint file or directory merged onto pretrained WAN weights before --ckpt_path. " "Use this when the experiment checkpoint is only a lightweight overlay, such as track_context-only training."))
     group.add_argument("--ckpt_path", dest="checkpoint_path", type=str, default=None, help=("Path to checkpoint file or directory (optional; merged onto pretrained WAN weights). " "Supports checkpoints that include dit/action_encoder keys."))
+    group.add_argument("--run_mode", type=str, choices=["infer", "metrics", "all"], default="all", help="Execution stage control: infer=generate videos only; metrics=evaluate existing outputs only; all=generate videos then evaluate metrics.")
     group.add_argument("--metrics", type=str, choices=["core", "all"], default="core", help="Evaluation metric set: core=psnr,ssim,mse,lpips,fid,fvd; all=core plus PBench metrics.")
     group.add_argument("--batch_videos", type=int, default=1, help="Number of comparison videos to preprocess per evaluation batch. Lower values reduce peak memory usage for both core and all metrics modes.")
     group.add_argument("--resume", type=int, choices=[0, 1], default=1, help="Resume generation by skipping existing comparison videos instead of overwriting them.")
