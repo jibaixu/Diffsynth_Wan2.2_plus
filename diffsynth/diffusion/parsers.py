@@ -130,8 +130,12 @@ def add_track_context_config(parser: argparse.ArgumentParser):
     group.add_argument("--track_num_points", type=int, default=256, help="Maximum number of visible track points sampled per view.")
     group.add_argument("--track_point_radius", type=int, default=6, help="Rendered circle radius for each sampled track point.")
     group.add_argument("--track_seed", type=int, default=42, help="Base random seed used for per-view track point sampling.")
-    group.add_argument("--track_apply_noise", type=int, choices=[0, 1], default=0, help="Apply small coordinate noise to track points before rendering track maps.")
-    group.add_argument("--track_noise_std", type=float, default=0.003, help="Standard deviation of the coordinate noise added in normalized track space.")
+    group.add_argument("--track_apply_noise", type=int, choices=[0, 1], default=0, help="Apply future-only structured tracker-error perturbations before rendering track maps.")
+    group.add_argument("--track_noise_corrupt_ratio", type=float, default=0.3, help="Ratio of sampled tracks whose future points are corrupted.")
+    group.add_argument("--track_noise_offset_scale", type=float, default=0.008, help="Normalized scale of the future-only per-track base offset.")
+    group.add_argument("--track_noise_drift_scale", type=float, default=0.002, help="Normalized scale of the smooth future-only drift applied to corrupted tracks.")
+    group.add_argument("--track_noise_dropout_ratio", type=float, default=0.1, help="Ratio of corrupted tracks that receive an additional local failure (freeze, drift, or hide).")
+    group.add_argument("--track_noise_warmup_frames", type=int, default=3, help="Number of future frames used to ramp structured noise from the fixed frame-0 query point.")
     group.add_argument("--track_context_scale", type=float, default=1.0, help="Residual scale for track-context hint injection.")
     return parser
 

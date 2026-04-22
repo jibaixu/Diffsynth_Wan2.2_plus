@@ -2,8 +2,10 @@
 推理引擎：负责所有推理逻辑
 包括：检查点管理、数据加载、视频生成
 """
+import io
 import json
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -12,6 +14,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
 
 from diffsynth.core import UnifiedDataset
@@ -36,6 +39,9 @@ from inference_support import (
 )
 
 _STATE_POSE_INDICES = tuple({name: idx for idx, name in enumerate(OBS_ACTION_NAMES)}[name] for name in POSE_NAMES)
+_DYNAMIC_TRACK_LABEL_BG = 0
+_DYNAMIC_TRACK_LABEL_ARM = 1
+_DYNAMIC_TRACK_MAIN_VIEW_INDEX = 0
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,12 @@ class InferenceSample:
     total_frames: int
     input_height: int
     input_width: int
+
+
+@dataclass
+class DynamicTrackPointState:
+    points: torch.Tensor
+    labels: torch.Tensor
 
 
 class InferenceEngine:
@@ -102,6 +114,7 @@ class InferenceEngine:
         self._state_pose_cache: Dict[str, np.ndarray] = {}
         self._active_output_dirs: Optional[Dict[str, Path]] = None
         self._diagnostic_track_exports: set[tuple[int, int]] = set()
+        self._requests_module = None
 
     def run(self) -> None:
         try:
@@ -135,6 +148,23 @@ class InferenceEngine:
             self.sample_indices = all_sample_indices[self.dist_context.rank :: self.dist_context.world_size]
         else:
             self.sample_indices = []
+
+        if self._dynamic_track_sampling_requested() and not self._should_use_atm_track() and self._is_main_process():
+            self.logger.warning(
+                "Dynamic ATM track sampling was requested, but ATM track conditioning is disabled; ignoring it."
+            )
+        if self._should_use_dynamic_track_sampling():
+            self._ensure_dynamic_track_sampling_dependencies()
+            if self._is_main_process():
+                self.logger.info(
+                    "Dynamic ATM point-set maintenance enabled for main view only: "
+                    "server=%s, prompt=%r, arm_ratio=%.3f, dedupe_px=%s, margin=%.4f",
+                    self._seg_server_url(),
+                    self._seg_text_prompt(),
+                    self._dynamic_track_arm_ratio(),
+                    self._dynamic_track_dedupe_px(),
+                    self._dynamic_track_margin(),
+                )
 
         if self._is_main_process():
             self.logger.info("Run mode: %s", self._run_mode())
@@ -539,6 +569,51 @@ class InferenceEngine:
             getattr(self.config.runtime, "track_context_enabled", False)
         )
 
+    def _dynamic_track_sampling_requested(self) -> bool:
+        return bool(int(getattr(self.config, "use_dynamic_track_sampling", 0)))
+
+    def _should_use_dynamic_track_sampling(self) -> bool:
+        return self._dynamic_track_sampling_requested() and self._should_use_atm_track()
+
+    def _dynamic_track_arm_ratio(self) -> float:
+        return float(np.clip(float(getattr(self.config, "dynamic_track_arm_ratio", 0.7)), 0.0, 1.0))
+
+    def _dynamic_track_dedupe_px(self) -> float:
+        return max(0.0, float(getattr(self.config, "dynamic_track_dedupe_px", 2.0)))
+
+    def _dynamic_track_margin(self) -> float:
+        return float(np.clip(float(getattr(self.config, "dynamic_track_margin", 0.02)), 0.0, 0.49))
+
+    def _seg_server_url(self) -> str:
+        return str(getattr(self.config, "seg_server_url", "http://127.0.0.1:8000/segment")).strip()
+
+    def _seg_text_prompt(self) -> str:
+        return str(getattr(self.config, "seg_text_prompt", "robotic arm")).strip() or "robotic arm"
+
+    def _seg_box_threshold(self) -> float:
+        return float(getattr(self.config, "seg_box_threshold", 0.3))
+
+    def _seg_text_threshold(self) -> float:
+        return float(getattr(self.config, "seg_text_threshold", 0.25))
+
+    def _seg_timeout(self) -> float:
+        return float(getattr(self.config, "seg_timeout", 300.0))
+
+    def _ensure_dynamic_track_sampling_dependencies(self):
+        if self._requests_module is not None:
+            return self._requests_module
+        try:
+            self._requests_module = import_module("requests")
+        except ImportError as exc:  # pragma: no cover - environment-specific guard
+            raise ImportError(
+                "Dynamic ATM track sampling requires the `requests` package in the current environment."
+            ) from exc
+        return self._requests_module
+
+    @staticmethod
+    def _dynamic_track_seed(sample_index: int, chunk_start: int, salt: int = 0) -> int:
+        return int(sample_index) * 100003 + int(chunk_start) * 1009 + int(salt)
+
     def _resolve_prompt_emb_bert_path(
         self,
         metadata_entry: Dict,
@@ -576,7 +651,7 @@ class InferenceEngine:
                 )
         return self.atm_engine
 
-    def _predict_track_video_for_window(
+    def _predict_track_for_window(
         self,
         *,
         sample,
@@ -589,6 +664,7 @@ class InferenceEngine:
         num_views: int,
         height: int,
         width: int,
+        query_tracks_by_view: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         atm_engine = self._get_atm_engine()
         if atm_engine is None:
@@ -621,7 +697,7 @@ class InferenceEngine:
                 atm_video,
                 task_emb,
                 state_pose,
-                track=None,
+                track=None if query_tracks_by_view is None else query_tracks_by_view.get(view_idx),
             )
             predicted_track = predicted_track.detach().to(dtype=torch.float32).cpu()
             if predicted_track.ndim != 4 or predicted_track.shape[0] != 1:
@@ -643,19 +719,69 @@ class InferenceEngine:
             raise RuntimeError(
                 f"Expected {num_views} ATM predictions for sample {sample}, got {len(predicted_tracks)}."
             )
-        predicted_tracks = torch.stack(predicted_tracks, dim=0)
+        return torch.stack(predicted_tracks, dim=0)
+
+    def _render_track_condition_from_prediction(
+        self,
+        predicted_track: Optional[torch.Tensor],
+        *,
+        target_frames: int,
+        infer_frames: int,
+        height: int,
+        width: int,
+    ) -> Optional[torch.Tensor]:
+        if predicted_track is None:
+            return None
         rendered_track = self._render_track_video_from_prediction(
-            predicted_tracks,
+            predicted_track,
             height=height,
             width=width,
         )
-        self._log_diagnostic_tensor("atm_rendered_track", rendered_track, prefix=prefix)
         return self._slice_and_pad_track_video(
             track_video=rendered_track,
             start=0,
             target_frames=target_frames,
             infer_frames=infer_frames,
         )
+
+    def _predict_track_video_for_window(
+        self,
+        *,
+        sample,
+        metadata_entry: Dict,
+        input_video: torch.Tensor,
+        task_emb: torch.Tensor,
+        chunk_start: int,
+        target_frames: int,
+        infer_frames: int,
+        num_views: int,
+        height: int,
+        width: int,
+        query_tracks_by_view: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> Optional[torch.Tensor]:
+        predicted_track = self._predict_track_for_window(
+            sample=sample,
+            metadata_entry=metadata_entry,
+            input_video=input_video,
+            task_emb=task_emb,
+            chunk_start=chunk_start,
+            target_frames=target_frames,
+            infer_frames=infer_frames,
+            num_views=num_views,
+            height=height,
+            width=width,
+            query_tracks_by_view=query_tracks_by_view,
+        )
+        rendered_track = self._render_track_condition_from_prediction(
+            predicted_track,
+            target_frames=target_frames,
+            infer_frames=infer_frames,
+            height=height,
+            width=width,
+        )
+        prefix = f"[Diag sample {sample} chunk {chunk_start}]"
+        self._log_diagnostic_tensor("atm_rendered_track", rendered_track, prefix=prefix)
+        return rendered_track
 
     def _load_prompt_emb_bert_tensor(self, path: str) -> torch.Tensor:
         resolved_path = Path(path)
@@ -901,6 +1027,388 @@ class InferenceEngine:
             frame = flat.reshape(1, 1, int(flat.shape[1]), target_height, target_width)
         return frame.contiguous()
 
+    def _build_uniform_query_points(self, num_points: int) -> torch.Tensor:
+        side = int(np.sqrt(num_points))
+        if side * side != int(num_points):
+            raise ValueError(
+                f"Dynamic ATM sampling requires a square number of query points, got {num_points}."
+            )
+        margin = self._dynamic_track_margin()
+        y = torch.linspace(margin, 1.0 - margin, side, dtype=torch.float32)
+        x = torch.linspace(margin, 1.0 - margin, side, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        return torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2).contiguous()
+
+    def _build_uniform_dynamic_track_state(self, num_points: int) -> DynamicTrackPointState:
+        return DynamicTrackPointState(
+            points=self._build_uniform_query_points(num_points),
+            labels=torch.full((int(num_points),), _DYNAMIC_TRACK_LABEL_BG, dtype=torch.long),
+        )
+
+    @staticmethod
+    def _repeat_query_points_over_time(points: torch.Tensor, num_steps: int) -> torch.Tensor:
+        return points.detach().cpu().float().unsqueeze(0).unsqueeze(0).repeat(1, int(num_steps), 1, 1).contiguous()
+
+    @staticmethod
+    def _pixel_denominator(size: int) -> int:
+        return max(int(size) - 1, 1)
+
+    @classmethod
+    def _points_to_pixel_xy(cls, points: torch.Tensor, width: int, height: int) -> np.ndarray:
+        if points.numel() == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        points_np = points.detach().cpu().numpy()
+        x = np.round(points_np[:, 0] * cls._pixel_denominator(width)).astype(np.int64)
+        y = np.round(points_np[:, 1] * cls._pixel_denominator(height)).astype(np.int64)
+        x = np.clip(x, 0, max(int(width) - 1, 0))
+        y = np.clip(y, 0, max(int(height) - 1, 0))
+        return np.stack([x, y], axis=-1)
+
+    @classmethod
+    def _pixel_xy_to_points(cls, pixel_xy: np.ndarray, width: int, height: int) -> torch.Tensor:
+        if pixel_xy.size == 0:
+            return torch.empty((0, 2), dtype=torch.float32)
+        pixel_xy = np.asarray(pixel_xy, dtype=np.float32)
+        points = np.stack(
+            [
+                pixel_xy[:, 0] / float(cls._pixel_denominator(width)),
+                pixel_xy[:, 1] / float(cls._pixel_denominator(height)),
+            ],
+            axis=-1,
+        )
+        return torch.from_numpy(points).float()
+
+    def _sample_binary_mask_at_points(self, mask: np.ndarray, points: torch.Tensor) -> np.ndarray:
+        pixel_xy = self._points_to_pixel_xy(points, width=int(mask.shape[1]), height=int(mask.shape[0]))
+        if pixel_xy.size == 0:
+            return np.zeros((0,), dtype=bool)
+        return mask[pixel_xy[:, 1], pixel_xy[:, 0]].astype(bool)
+
+    def _sample_points_from_mask(
+        self,
+        mask: np.ndarray,
+        count: int,
+        rng: np.random.Generator,
+        *,
+        excluded_pixel_xy: Optional[np.ndarray] = None,
+    ) -> torch.Tensor:
+        count = int(count)
+        if count <= 0:
+            return torch.empty((0, 2), dtype=torch.float32)
+        mask = np.asarray(mask, dtype=bool)
+        coords_yx = np.argwhere(mask)
+        if coords_yx.size == 0:
+            return torch.empty((0, 2), dtype=torch.float32)
+
+        height, width = int(mask.shape[0]), int(mask.shape[1])
+        if excluded_pixel_xy is not None and np.asarray(excluded_pixel_xy).size > 0:
+            excluded_pixel_xy = np.asarray(excluded_pixel_xy, dtype=np.int64).reshape(-1, 2)
+            excluded_flat = excluded_pixel_xy[:, 1] * width + excluded_pixel_xy[:, 0]
+            candidate_flat = coords_yx[:, 0] * width + coords_yx[:, 1]
+            coords_yx = coords_yx[~np.isin(candidate_flat, excluded_flat)]
+            if coords_yx.size == 0:
+                return torch.empty((0, 2), dtype=torch.float32)
+
+        replace = int(coords_yx.shape[0]) < count
+        chosen_indices = rng.choice(int(coords_yx.shape[0]), size=count, replace=replace)
+        chosen_yx = coords_yx[np.asarray(chosen_indices, dtype=np.int64)]
+        chosen_xy = np.stack([chosen_yx[:, 1], chosen_yx[:, 0]], axis=-1)
+        return self._pixel_xy_to_points(chosen_xy, width=width, height=height)
+
+    def _segment_frame(self, frame) -> np.ndarray:
+        requests = self._ensure_dynamic_track_sampling_dependencies()
+        frame_uint8 = self.video_saver.converter.ensure_rgb(self.video_saver.converter.to_uint8(frame))
+        image_buffer = io.BytesIO()
+        Image.fromarray(frame_uint8).save(image_buffer, format="PNG")
+        image_buffer.seek(0)
+        response = requests.post(
+            self._seg_server_url(),
+            files={"image": ("frame.png", image_buffer.getvalue(), "image/png")},
+            data={
+                "text_prompt": self._seg_text_prompt(),
+                "box_threshold": self._seg_box_threshold(),
+                "text_threshold": self._seg_text_threshold(),
+            },
+            timeout=self._seg_timeout(),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        mask = np.asarray(payload["mask"], dtype=np.int32)
+        expected_shape = frame_uint8.shape[:2]
+        if tuple(mask.shape) != tuple(expected_shape):
+            raise ValueError(f"Segmentation mask shape mismatch: expected {expected_shape}, got {tuple(mask.shape)}.")
+        return mask
+
+    def _try_segment_frame(
+        self,
+        frame,
+        *,
+        sample_index: int,
+        chunk_start: int,
+        stage: str,
+    ) -> Optional[np.ndarray]:
+        try:
+            return self._segment_frame(frame)
+        except Exception as exc:  # pragma: no cover - network/service dependent
+            if self._is_main_process():
+                self.logger.warning(
+                    "Dynamic ATM segmentation failed for sample %s chunk %s (%s): %s",
+                    sample_index,
+                    chunk_start,
+                    stage,
+                    exc,
+                )
+            return None
+
+    def _initialize_dynamic_track_point_state(
+        self,
+        sample: InferenceSample,
+        input_video: torch.Tensor,
+        *,
+        num_points: int,
+    ) -> DynamicTrackPointState:
+        state = self._build_uniform_dynamic_track_state(num_points)
+        frame = input_video[_DYNAMIC_TRACK_MAIN_VIEW_INDEX, :, 0]
+        mask = self._try_segment_frame(
+            frame,
+            sample_index=sample.sample_index,
+            chunk_start=0,
+            stage="initialization",
+        )
+        if mask is None:
+            if self._is_main_process():
+                self.logger.info(
+                    "Dynamic ATM sampling sample %s init: segmentation unavailable, using uniform background labels.",
+                    sample.sample_index,
+                )
+            return state
+
+        arm_mask = mask > 0
+        if not np.any(arm_mask):
+            if self._is_main_process():
+                self.logger.info(
+                    "Dynamic ATM sampling sample %s init: no arm mask found, using uniform background labels.",
+                    sample.sample_index,
+                )
+            return state
+
+        labels = self._sample_binary_mask_at_points(arm_mask, state.points).astype(np.int64)
+        initialized_state = DynamicTrackPointState(
+            points=state.points,
+            labels=torch.from_numpy(labels).long(),
+        )
+        if self._is_main_process():
+            arm_count = int((initialized_state.labels == _DYNAMIC_TRACK_LABEL_ARM).sum().item())
+            bg_count = int(initialized_state.labels.numel()) - arm_count
+            self.logger.info(
+                "Dynamic ATM sampling sample %s init: arm=%s bg=%s total=%s",
+                sample.sample_index,
+                arm_count,
+                bg_count,
+                int(initialized_state.labels.numel()),
+            )
+        return initialized_state
+
+    def _update_dynamic_track_point_state(
+        self,
+        *,
+        sample: InferenceSample,
+        previous_state: DynamicTrackPointState,
+        predicted_track_main_view: torch.Tensor,
+        main_view_frame: torch.Tensor,
+        chunk_start: int,
+        num_points: int,
+    ) -> DynamicTrackPointState:
+        fallback_state = self._build_uniform_dynamic_track_state(num_points)
+        if predicted_track_main_view.ndim != 3 or int(predicted_track_main_view.shape[-1]) != 2:
+            if self._is_main_process():
+                self.logger.warning(
+                    "Dynamic ATM sampling sample %s chunk %s: invalid predicted track shape %s; falling back to uniform resampling.",
+                    sample.sample_index,
+                    chunk_start,
+                    tuple(predicted_track_main_view.shape),
+                )
+            return fallback_state
+
+        last_points = predicted_track_main_view[-1].detach().cpu().float()
+        if int(last_points.shape[0]) != int(previous_state.labels.numel()):
+            if self._is_main_process():
+                self.logger.warning(
+                    "Dynamic ATM sampling sample %s chunk %s: point count mismatch %s vs %s; falling back to uniform resampling.",
+                    sample.sample_index,
+                    chunk_start,
+                    int(last_points.shape[0]),
+                    int(previous_state.labels.numel()),
+                )
+            return fallback_state
+
+        labels = previous_state.labels.detach().cpu().long()
+        finite_mask = torch.isfinite(last_points).all(dim=-1)
+        in_bounds_mask = ((last_points >= 0.0) & (last_points <= 1.0)).all(dim=-1)
+        valid_mask = finite_mask & in_bounds_mask
+        valid_points = last_points[valid_mask]
+        valid_labels = labels[valid_mask]
+        after_bounds = int(valid_points.shape[0])
+
+        pixel_xy = self._points_to_pixel_xy(valid_points, width=sample.input_width, height=sample.input_height)
+        if pixel_xy.size > 0 and self._dynamic_track_dedupe_px() > 0.0:
+            survivor_indices: List[int] = []
+            survivor_pixels: List[np.ndarray] = []
+            dedupe_radius_sq = float(self._dynamic_track_dedupe_px()) ** 2
+            for idx, xy in enumerate(pixel_xy):
+                if survivor_pixels:
+                    existing = np.asarray(survivor_pixels, dtype=np.float32)
+                    delta = existing - xy.astype(np.float32)
+                    if np.any(np.sum(delta * delta, axis=1) <= dedupe_radius_sq):
+                        continue
+                survivor_indices.append(idx)
+                survivor_pixels.append(xy)
+            valid_points = valid_points[survivor_indices]
+            valid_labels = valid_labels[survivor_indices]
+            pixel_xy = pixel_xy[np.asarray(survivor_indices, dtype=np.int64)]
+        after_dedupe = int(valid_points.shape[0])
+
+        mask = self._try_segment_frame(
+            main_view_frame,
+            sample_index=sample.sample_index,
+            chunk_start=chunk_start,
+            stage="chunk_update",
+        )
+        if mask is None:
+            if self._is_main_process():
+                self.logger.info(
+                    "Dynamic ATM sampling sample %s chunk %s: segmentation unavailable, falling back to uniform resampling.",
+                    sample.sample_index,
+                    chunk_start,
+                )
+            return fallback_state
+
+        arm_mask = mask > 0
+        if not np.any(arm_mask):
+            if self._is_main_process():
+                self.logger.info(
+                    "Dynamic ATM sampling sample %s chunk %s: no arm mask found, falling back to uniform resampling.",
+                    sample.sample_index,
+                    chunk_start,
+                )
+            return fallback_state
+
+        current_is_arm = self._sample_binary_mask_at_points(arm_mask, valid_points)
+        kept_points: List[torch.Tensor] = []
+        kept_labels: List[int] = []
+        kept_pixels: List[np.ndarray] = []
+        dropped_arm_to_bg = 0
+        relabeled_bg_to_arm = 0
+        for point, old_label, is_arm, point_xy in zip(valid_points, valid_labels.tolist(), current_is_arm.tolist(), pixel_xy):
+            if int(old_label) == _DYNAMIC_TRACK_LABEL_ARM and not bool(is_arm):
+                dropped_arm_to_bg += 1
+                continue
+            if int(old_label) == _DYNAMIC_TRACK_LABEL_BG and bool(is_arm):
+                relabeled_bg_to_arm += 1
+            kept_points.append(point)
+            kept_labels.append(_DYNAMIC_TRACK_LABEL_ARM if bool(is_arm) else _DYNAMIC_TRACK_LABEL_BG)
+            kept_pixels.append(point_xy)
+
+        if kept_points:
+            survivor_points = torch.stack(kept_points, dim=0).float()
+            survivor_labels = torch.as_tensor(kept_labels, dtype=torch.long)
+            survivor_pixel_xy = np.asarray(kept_pixels, dtype=np.int64)
+        else:
+            survivor_points = torch.empty((0, 2), dtype=torch.float32)
+            survivor_labels = torch.empty((0,), dtype=torch.long)
+            survivor_pixel_xy = np.zeros((0, 2), dtype=np.int64)
+
+        target_arm = int(round(self._dynamic_track_arm_ratio() * int(num_points)))
+        target_arm = max(0, min(int(num_points), target_arm))
+        rng = np.random.default_rng(
+            int(getattr(self.config, "track_seed", 42)) + self._dynamic_track_seed(sample.sample_index, chunk_start, salt=17)
+        )
+        current_arm = int((survivor_labels == _DYNAMIC_TRACK_LABEL_ARM).sum().item())
+        arm_needed = max(0, target_arm - current_arm)
+        added_arm_points = self._sample_points_from_mask(
+            arm_mask,
+            arm_needed,
+            rng,
+            excluded_pixel_xy=survivor_pixel_xy,
+        )
+        added_arm_labels = torch.full((int(added_arm_points.shape[0]),), _DYNAMIC_TRACK_LABEL_ARM, dtype=torch.long)
+
+        excluded_after_arm = survivor_pixel_xy
+        if int(added_arm_points.shape[0]) > 0:
+            added_arm_pixels = self._points_to_pixel_xy(
+                added_arm_points,
+                width=sample.input_width,
+                height=sample.input_height,
+            )
+            excluded_after_arm = np.concatenate([excluded_after_arm, added_arm_pixels], axis=0)
+
+        remaining_after_arm = int(num_points) - int(survivor_points.shape[0]) - int(added_arm_points.shape[0])
+        added_bg_points = self._sample_points_from_mask(
+            ~arm_mask,
+            remaining_after_arm,
+            rng,
+            excluded_pixel_xy=excluded_after_arm,
+        )
+        added_bg_labels = torch.full((int(added_bg_points.shape[0]),), _DYNAMIC_TRACK_LABEL_BG, dtype=torch.long)
+
+        final_points_list = [survivor_points]
+        final_labels_list = [survivor_labels]
+        if int(added_arm_points.shape[0]) > 0:
+            final_points_list.append(added_arm_points)
+            final_labels_list.append(added_arm_labels)
+        if int(added_bg_points.shape[0]) > 0:
+            final_points_list.append(added_bg_points)
+            final_labels_list.append(added_bg_labels)
+
+        assembled_points = torch.cat(final_points_list, dim=0) if final_points_list else torch.empty((0, 2), dtype=torch.float32)
+        assembled_labels = torch.cat(final_labels_list, dim=0) if final_labels_list else torch.empty((0,), dtype=torch.long)
+
+        if int(assembled_points.shape[0]) < int(num_points):
+            extra_count = int(num_points) - int(assembled_points.shape[0])
+            assembled_pixels = self._points_to_pixel_xy(
+                assembled_points,
+                width=sample.input_width,
+                height=sample.input_height,
+            )
+            extra_points = self._sample_points_from_mask(
+                np.ones_like(arm_mask, dtype=bool),
+                extra_count,
+                rng,
+                excluded_pixel_xy=assembled_pixels,
+            )
+            extra_is_arm = self._sample_binary_mask_at_points(arm_mask, extra_points).astype(np.int64)
+            assembled_points = torch.cat([assembled_points, extra_points], dim=0)
+            assembled_labels = torch.cat([assembled_labels, torch.from_numpy(extra_is_arm).long()], dim=0)
+
+        if int(assembled_points.shape[0]) > int(num_points):
+            assembled_points = assembled_points[: int(num_points)]
+            assembled_labels = assembled_labels[: int(num_points)]
+
+        updated_state = DynamicTrackPointState(
+            points=assembled_points.contiguous(),
+            labels=assembled_labels.contiguous(),
+        )
+        if self._is_main_process():
+            arm_count = int((updated_state.labels == _DYNAMIC_TRACK_LABEL_ARM).sum().item())
+            bg_count = int(updated_state.labels.numel()) - arm_count
+            self.logger.info(
+                "Dynamic ATM sampling sample %s chunk %s: "
+                "after_bounds=%s after_dedupe=%s kept=%s drop_arm_to_bg=%s relabel_bg_to_arm=%s "
+                "add_arm=%s add_bg=%s final_arm=%s final_bg=%s",
+                sample.sample_index,
+                chunk_start,
+                after_bounds,
+                after_dedupe,
+                int(survivor_points.shape[0]),
+                dropped_arm_to_bg,
+                relabeled_bg_to_arm,
+                int(added_arm_points.shape[0]),
+                int(added_bg_points.shape[0]),
+                arm_count,
+                bg_count,
+            )
+        return updated_state
+
     def _render_track_video_from_prediction(
         self,
         predicted_track: torch.Tensor,
@@ -1027,6 +1535,10 @@ class InferenceEngine:
         if self._should_use_atm_track() and not self._use_autoregressive_history_template_mode():
             self.logger.info("Using chunk-wise ATM-rendered track maps; each inference window recomputes ATM tracks.")
             self.logger.info("Inference track rendering noise disabled.")
+            if self._should_use_dynamic_track_sampling() and sample.total_frames > int(self.config.num_frames):
+                self.logger.info(
+                    "Main view uses dynamic segmentation-guided point-set maintenance; non-main views keep uniform ATM resampling."
+                )
         elif sample.track_video is not None:
             self.logger.info("Using precomputed track maps: %s", tuple(sample.track_video.shape))
             if sample.total_frames > int(sample.track_video.shape[2]):
@@ -1203,6 +1715,14 @@ class InferenceEngine:
 
         predicted_chunks: List[torch.Tensor] = []
         last_input_video = sample.original_video[:, :, :history_frames]
+        atm_engine = self._get_atm_engine() if self._should_use_atm_track() else None
+        dynamic_main_view_state: Optional[DynamicTrackPointState] = None
+        if self._should_use_dynamic_track_sampling() and atm_engine is not None:
+            dynamic_main_view_state = self._initialize_dynamic_track_point_state(
+                sample,
+                last_input_video,
+                num_points=int(atm_engine.num_track_ids),
+            )
         for chunk_idx, start in enumerate(chunk_starts):
             chunk_frames = min(chunk_size, sample.total_frames - start)
             infer_frames = self._align_num_frames(chunk_frames)
@@ -1214,18 +1734,47 @@ class InferenceEngine:
             )
             chunk_input_video = last_input_video
             if self._should_use_atm_track():
-                chunk_track = self._predict_track_video_for_window(
-                    sample=sample.sample_index,
-                    metadata_entry=sample.metadata_entry,
-                    input_video=chunk_input_video,
-                    task_emb=sample.atm_task_emb,
-                    chunk_start=start,
-                    target_frames=chunk_frames,
-                    infer_frames=infer_frames,
-                    num_views=sample.num_views,
-                    height=sample.input_height,
-                    width=sample.input_width,
-                )
+                chunk_track_prediction = None
+                if dynamic_main_view_state is not None and atm_engine is not None:
+                    chunk_track_prediction = self._predict_track_for_window(
+                        sample=sample.sample_index,
+                        metadata_entry=sample.metadata_entry,
+                        input_video=chunk_input_video,
+                        task_emb=sample.atm_task_emb,
+                        chunk_start=start,
+                        target_frames=chunk_frames,
+                        infer_frames=infer_frames,
+                        num_views=sample.num_views,
+                        height=sample.input_height,
+                        width=sample.input_width,
+                        query_tracks_by_view={
+                            _DYNAMIC_TRACK_MAIN_VIEW_INDEX: self._repeat_query_points_over_time(
+                                dynamic_main_view_state.points,
+                                int(atm_engine.num_track_ts),
+                            )
+                        },
+                    )
+                    chunk_track = self._render_track_condition_from_prediction(
+                        chunk_track_prediction,
+                        target_frames=chunk_frames,
+                        infer_frames=infer_frames,
+                        height=sample.input_height,
+                        width=sample.input_width,
+                    )
+                else:
+                    chunk_track = self._predict_track_video_for_window(
+                        sample=sample.sample_index,
+                        metadata_entry=sample.metadata_entry,
+                        input_video=chunk_input_video,
+                        task_emb=sample.atm_task_emb,
+                        chunk_start=start,
+                        target_frames=chunk_frames,
+                        infer_frames=infer_frames,
+                        num_views=sample.num_views,
+                        height=sample.input_height,
+                        width=sample.input_width,
+                    )
+                    chunk_track_prediction = None
             else:
                 chunk_track = self._slice_and_pad_track_video(
                     track_video=track_video,
@@ -1264,6 +1813,16 @@ class InferenceEngine:
                 predicted_video=chunk_video,
             )
             chunk_video = self._restore_history_frames(chunk_video, chunk_input_video, history_frames)
+            if dynamic_main_view_state is not None and chunk_track_prediction is not None and int(chunk_video.shape[2]) > 0:
+                chunk_track_prediction = self._slice_and_pad_predicted_track(chunk_track_prediction, chunk_frames)
+                dynamic_main_view_state = self._update_dynamic_track_point_state(
+                    sample=sample,
+                    previous_state=dynamic_main_view_state,
+                    predicted_track_main_view=chunk_track_prediction[_DYNAMIC_TRACK_MAIN_VIEW_INDEX],
+                    main_view_frame=chunk_video[_DYNAMIC_TRACK_MAIN_VIEW_INDEX, :, -1],
+                    chunk_start=start,
+                    num_points=int(atm_engine.num_track_ids),
+                )
             if int(chunk_video.shape[2]) > 0:
                 last_input_video = chunk_video[:, :, -history_frames:].contiguous()
             if chunk_idx > 0:
@@ -1431,6 +1990,24 @@ class InferenceEngine:
         pad_frames = infer_frames - current_frames
         pad = chunk_track[:, :, -1:, :, :].repeat(1, 1, pad_frames, 1, 1)
         return torch.cat([chunk_track, pad], dim=2)
+
+    @staticmethod
+    def _slice_and_pad_predicted_track(
+        predicted_track: Optional[torch.Tensor],
+        target_frames: int,
+    ) -> Optional[torch.Tensor]:
+        if predicted_track is None:
+            return None
+        chunk_track = predicted_track[:, :target_frames]
+        current_frames = int(chunk_track.shape[1])
+        if current_frames >= target_frames:
+            return chunk_track[:, :target_frames]
+        if current_frames <= 0:
+            if int(predicted_track.shape[1]) <= 0:
+                return chunk_track
+            return predicted_track[:, -1:, :, :].repeat(1, target_frames, 1, 1)
+        pad = chunk_track[:, -1:, :, :].repeat(1, target_frames - current_frames, 1, 1)
+        return torch.cat([chunk_track, pad], dim=1)
 
     @staticmethod
     def _restore_history_frames(

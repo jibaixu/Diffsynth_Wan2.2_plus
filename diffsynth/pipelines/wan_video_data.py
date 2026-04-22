@@ -57,7 +57,11 @@ def build_wan_video_dataset(
     track_point_radius: int = 6,
     track_seed: int = 42,
     track_apply_noise: bool = False,
-    track_noise_std: float = 0.0,
+    track_noise_corrupt_ratio: float = 0.3,
+    track_noise_offset_scale: float = 0.008,
+    track_noise_drift_scale: float = 0.002,
+    track_noise_dropout_ratio: float = 0.1,
+    track_noise_warmup_frames: int = 3,
 ) -> UnifiedDataset:
     keys = _normalize_data_file_keys(data_file_keys, runtime.data_file_keys)
     operator_num_frames = int(dataset_num_frames) if dataset_num_frames is not None else int(num_frames)
@@ -104,7 +108,11 @@ def build_wan_video_dataset(
             point_radius=track_point_radius,
             seed=track_seed,
             apply_noise=track_apply_noise,
-            noise_std=track_noise_std,
+            noise_corrupt_ratio=track_noise_corrupt_ratio,
+            noise_offset_scale=track_noise_offset_scale,
+            noise_drift_scale=track_noise_drift_scale,
+            noise_dropout_ratio=track_noise_dropout_ratio,
+            noise_warmup_frames=track_noise_warmup_frames,
         )
 
     if "action" not in keys:

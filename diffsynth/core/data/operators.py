@@ -744,7 +744,12 @@ class LoadTrackMapVideo(DataProcessingOperator):
         point_radius=6,
         seed=42,
         apply_noise=False,
-        noise_std=0.0,
+        noise_std=None,
+        noise_corrupt_ratio=0.3,
+        noise_offset_scale=0.008,
+        noise_drift_scale=0.002,
+        noise_dropout_ratio=0.1,
+        noise_warmup_frames=3,
     ):
         if height is None or width is None:
             raise ValueError("`height` and `width` are required for track-map rendering.")
@@ -758,7 +763,11 @@ class LoadTrackMapVideo(DataProcessingOperator):
         self.point_radius = int(point_radius)
         self.seed = int(seed)
         self.apply_noise = bool(apply_noise)
-        self.noise_std = float(noise_std)
+        self.noise_corrupt_ratio = float(noise_corrupt_ratio)
+        self.noise_offset_scale = float(noise_offset_scale)
+        self.noise_drift_scale = float(noise_drift_scale)
+        self.noise_dropout_ratio = float(noise_dropout_ratio)
+        self.noise_warmup_frames = int(noise_warmup_frames)
 
     def get_num_frames(self, total_frames):
         num_frames = int(self.num_frames)
@@ -857,6 +866,169 @@ class LoadTrackMapVideo(DataProcessingOperator):
             idx += 1
         return np.asarray(colors, dtype=np.uint8)
 
+    @staticmethod
+    def _count_from_ratio(num_items, ratio):
+        if num_items <= 0 or float(ratio) <= 0:
+            return 0
+        return min(int(num_items), max(1, int(math.ceil(float(ratio) * int(num_items)))))
+
+    def _future_warmup_weights(self, num_frames):
+        future_frames = max(0, int(num_frames) - 1)
+        if future_frames == 0:
+            return np.zeros((0,), dtype=np.float32)
+        weights = np.ones((future_frames,), dtype=np.float32)
+        warmup = min(max(int(self.noise_warmup_frames), 0), future_frames)
+        if warmup > 0:
+            weights[:warmup] = np.linspace(1.0 / float(warmup), 1.0, num=warmup).astype(np.float32)
+        return weights
+
+    @staticmethod
+    def _find_last_valid_frame(vis_track, track_points, max_frame_id):
+        for frame_id in range(int(max_frame_id), -1, -1):
+            if bool(vis_track[frame_id]) and np.isfinite(track_points[frame_id]).all():
+                return frame_id
+        return None
+
+    @staticmethod
+    def _sample_smooth_offsets(rng, num_steps, num_tracks, scale):
+        if num_steps <= 0 or num_tracks <= 0 or float(scale) <= 0:
+            return np.zeros((max(0, int(num_steps)), max(0, int(num_tracks)), 2), dtype=np.float32)
+        if int(num_steps) == 1:
+            return rng.normal(loc=0.0, scale=float(scale), size=(1, int(num_tracks), 2)).astype(np.float32)
+
+        num_steps = int(num_steps)
+        num_tracks = int(num_tracks)
+        num_ctrl = min(4, max(2, num_steps))
+        sample_steps = np.arange(num_steps, dtype=np.float32)
+        control_steps = np.linspace(0, num_steps - 1, num=num_ctrl, dtype=np.float32)
+        control_offsets = rng.normal(loc=0.0, scale=float(scale), size=(num_ctrl, num_tracks, 2)).astype(np.float32)
+        smooth_offsets = np.empty((num_steps, num_tracks, 2), dtype=np.float32)
+        for track_id in range(num_tracks):
+            for coord_id in range(2):
+                smooth_offsets[:, track_id, coord_id] = np.interp(
+                    sample_steps,
+                    control_steps,
+                    control_offsets[:, track_id, coord_id],
+                ).astype(np.float32)
+        return smooth_offsets
+
+    def _apply_structured_noise_to_tracks(self, tracks, vis, point_indices, noise_seed):
+        if not self.apply_noise:
+            return tracks, vis
+
+        num_frames = int(tracks.shape[0])
+        if num_frames <= 1 or len(point_indices) == 0:
+            return tracks, vis
+
+        tracks_noisy = np.asarray(tracks, dtype=np.float32).copy()
+        vis_noisy = np.asarray(vis, dtype=bool).copy()
+        sampled_tracks = tracks_noisy[:, point_indices].copy()
+        sampled_vis = vis_noisy[:, point_indices].copy()
+        sampled_finite = np.isfinite(sampled_tracks).all(axis=-1)
+
+        # The first frame contains the queried anchor points and must stay unchanged.
+        candidate_mask = sampled_vis[0] & sampled_finite[0]
+        candidate_mask &= np.any(sampled_vis[1:] & sampled_finite[1:], axis=0)
+        candidate_local_indices = np.flatnonzero(candidate_mask)
+        num_corrupt = self._count_from_ratio(candidate_local_indices.size, self.noise_corrupt_ratio)
+        if num_corrupt == 0:
+            return tracks_noisy, vis_noisy
+
+        rng = np.random.default_rng(int(noise_seed))
+        corrupt_local = np.asarray(
+            rng.choice(candidate_local_indices, size=num_corrupt, replace=False),
+            dtype=np.int64,
+        )
+
+        future_frames = num_frames - 1
+        future_weights = self._future_warmup_weights(num_frames)[:, None, None]
+        base_offset = rng.normal(
+            loc=0.0,
+            scale=self.noise_offset_scale,
+            size=(num_corrupt, 2),
+        ).astype(np.float32)
+        smooth_drift = self._sample_smooth_offsets(
+            rng,
+            future_frames,
+            num_corrupt,
+            self.noise_drift_scale,
+        )
+        future_delta = (base_offset[None, :, :] + smooth_drift) * future_weights
+
+        future_points = sampled_tracks[1:, corrupt_local].copy()
+        future_valid = sampled_vis[1:, corrupt_local] & np.isfinite(future_points).all(axis=-1)
+        if np.any(future_valid):
+            updated_future = np.clip(future_points + future_delta, 0.0, 1.0)
+            future_points[future_valid] = updated_future[future_valid]
+            sampled_tracks[1:, corrupt_local] = future_points
+
+        num_dropout = self._count_from_ratio(num_corrupt, self.noise_dropout_ratio)
+        if num_dropout > 0:
+            failure_positions = np.asarray(
+                rng.choice(np.arange(num_corrupt, dtype=np.int64), size=num_dropout, replace=False),
+                dtype=np.int64,
+            )
+            extra_scale = max(self.noise_offset_scale, self.noise_drift_scale)
+            for failure_pos in failure_positions:
+                point_local = int(corrupt_local[int(failure_pos)])
+                start_frame = int(rng.integers(1, num_frames))
+                failure_kind = int(rng.integers(0, 3))
+
+                if failure_kind == 0:
+                    sampled_vis[start_frame:, point_local] = False
+                    continue
+
+                if failure_kind == 1:
+                    anchor_frame = self._find_last_valid_frame(
+                        sampled_vis[:, point_local],
+                        sampled_tracks[:, point_local],
+                        start_frame - 1,
+                    )
+                    if anchor_frame is None:
+                        continue
+                    anchor = sampled_tracks[anchor_frame, point_local].copy()
+                    tail_points = sampled_tracks[start_frame:, point_local].copy()
+                    tail_valid = sampled_vis[start_frame:, point_local] & np.isfinite(tail_points).all(axis=-1)
+                    if np.any(tail_valid):
+                        tail_points[tail_valid] = anchor
+                        sampled_tracks[start_frame:, point_local] = np.clip(tail_points, 0.0, 1.0)
+                    continue
+
+                remaining_frames = num_frames - start_frame
+                if remaining_frames <= 0:
+                    continue
+                tail_points = sampled_tracks[start_frame:, point_local].copy()
+                tail_valid = sampled_vis[start_frame:, point_local] & np.isfinite(tail_points).all(axis=-1)
+                if not np.any(tail_valid):
+                    continue
+                extra_jump = rng.normal(
+                    loc=0.0,
+                    scale=extra_scale * 1.5,
+                    size=(1, 2),
+                ).astype(np.float32)
+                extra_drift = self._sample_smooth_offsets(
+                    rng,
+                    remaining_frames,
+                    1,
+                    extra_scale * 2.0,
+                )[:, 0, :]
+                tail_weights = np.ones((remaining_frames, 1), dtype=np.float32)
+                tail_warmup = min(max(int(self.noise_warmup_frames), 0), remaining_frames)
+                if tail_warmup > 0:
+                    tail_weights[:tail_warmup, 0] = np.linspace(
+                        1.0 / float(tail_warmup),
+                        1.0,
+                        num=tail_warmup,
+                    ).astype(np.float32)
+                extra_delta = (extra_jump + extra_drift) * tail_weights
+                updated_tail = np.clip(tail_points + extra_delta, 0.0, 1.0)
+                tail_points[tail_valid] = updated_tail[tail_valid]
+                sampled_tracks[start_frame:, point_local] = tail_points
+
+        tracks_noisy[:, point_indices] = sampled_tracks
+        vis_noisy[:, point_indices] = sampled_vis
+        return tracks_noisy, vis_noisy
+
     def _build_track_view(self, track_path, seed):
         with np.load(track_path) as data:
             tracks = np.asarray(data["tracks"], dtype=np.float32)
@@ -875,7 +1047,8 @@ class LoadTrackMapVideo(DataProcessingOperator):
         )
         colors = self._generate_distinct_colors(len(point_indices))
         noise_seed = int(seed) + 1000003
-        return tracks, vis, point_indices, colors, noise_seed
+        tracks, vis = self._apply_structured_noise_to_tracks(tracks, vis, point_indices, noise_seed)
+        return tracks, vis, point_indices, colors
 
     def _draw_point(self, canvas, x, y, color):
         radius = self.point_radius
@@ -899,17 +1072,6 @@ class LoadTrackMapVideo(DataProcessingOperator):
         if not np.any(valid):
             return canvas
 
-        if self.apply_noise and self.noise_std > 0:
-            noise_rng = np.random.default_rng(int(noise_seed) + int(frame_id) * 9973)
-            noise = noise_rng.normal(
-                loc=0.0,
-                scale=self.noise_std,
-                size=frame_points.shape,
-            ).astype(np.float32)
-            finite_mask = np.isfinite(frame_points).all(axis=1)
-            if np.any(finite_mask):
-                frame_points[finite_mask] = np.clip(frame_points[finite_mask] + noise[finite_mask], 0.0, 1.0)
-
         pixel_x = np.rint(frame_points[:, 0] * (self.width - 1)).astype(np.int32)
         pixel_y = np.rint(frame_points[:, 1] * (self.height - 1)).astype(np.int32)
         valid &= pixel_x >= 0
@@ -927,13 +1089,13 @@ class LoadTrackMapVideo(DataProcessingOperator):
 
         views = [self._build_track_view(track_path, self.seed + view_idx) for view_idx, track_path in enumerate(track_paths)]
         total_frames = int(views[0][0].shape[0])
-        for tracks, vis, _, _, _ in views[1:]:
+        for tracks, vis, _, _ in views[1:]:
             if int(tracks.shape[0]) != total_frames or vis.shape != views[0][1].shape:
                 raise ValueError("Mismatched track tensor shape across views.")
 
         selected_frame_ids = self._select_frame_indices(total_frames, start_frame, end_frame, frame_indices)
         rendered_views = []
-        for tracks, vis, point_indices, colors, noise_seed in views:
+        for tracks, vis, point_indices, colors in views:
             frames = []
             for frame_id in selected_frame_ids:
                 frame = self._render_frame(
@@ -942,7 +1104,6 @@ class LoadTrackMapVideo(DataProcessingOperator):
                     point_indices,
                     colors,
                     frame_id,
-                    noise_seed=noise_seed,
                 )
                 frames.append(torch.from_numpy(frame).permute(2, 0, 1).contiguous())
             rendered_views.append(torch.stack(frames, dim=1).float())

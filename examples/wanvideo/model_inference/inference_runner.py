@@ -71,6 +71,66 @@ def add_atm_config(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def add_dynamic_track_sampling_config(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    group = parser.add_argument_group("dynamic_track_sampling")
+    group.add_argument(
+        "--use_dynamic_track_sampling",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable segmentation-guided dynamic ATM query-point maintenance on the main view during chunked inference.",
+    )
+    group.add_argument(
+        "--seg_server_url",
+        type=str,
+        default="http://127.0.0.1:8000/segment",
+        help="FastAPI segmentation endpoint used by dynamic ATM point maintenance.",
+    )
+    group.add_argument(
+        "--seg_text_prompt",
+        type=str,
+        default="robotic arm",
+        help="Text prompt sent to the segmentation server for the main-view arm mask.",
+    )
+    group.add_argument(
+        "--seg_box_threshold",
+        type=float,
+        default=0.3,
+        help="Grounding box threshold for the segmentation request.",
+    )
+    group.add_argument(
+        "--seg_text_threshold",
+        type=float,
+        default=0.25,
+        help="Grounding text threshold for the segmentation request.",
+    )
+    group.add_argument(
+        "--seg_timeout",
+        type=float,
+        default=300.0,
+        help="Segmentation request timeout in seconds.",
+    )
+    group.add_argument(
+        "--dynamic_track_arm_ratio",
+        type=float,
+        default=0.7,
+        help="Target fraction of maintained points assigned to the arm mask when dynamic sampling is enabled.",
+    )
+    group.add_argument(
+        "--dynamic_track_dedupe_px",
+        type=float,
+        default=2.0,
+        help="Pixel-space dedupe radius used to prune overlapping maintained points.",
+    )
+    group.add_argument(
+        "--dynamic_track_margin",
+        type=float,
+        default=0.02,
+        help="Margin used by the fallback uniform grid query-point sampler.",
+    )
+    return parser
+
+
 def add_diagnostic_config(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("diagnostic")
     group.add_argument(
@@ -131,6 +191,7 @@ def parse_args():
     parser = add_lora_config(parser)
     parser = add_infer_config(parser)
     parser = add_atm_config(parser)
+    parser = add_dynamic_track_sampling_config(parser)
     parser = add_diagnostic_config(parser)
 
     for action in parser._actions:

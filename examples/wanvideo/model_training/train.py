@@ -28,9 +28,13 @@ def debug_on():
         "--num_history_frames", "1",
         "--history_template_sampling", "0",
         "--track_apply_noise", "1",
-        "--track_noise_std", "0.003",
+        "--track_noise_corrupt_ratio", "0.3",
+        "--track_noise_offset_scale", "0.008",
+        "--track_noise_drift_scale", "0.002",
+        "--track_noise_dropout_ratio", "0.1",
+        "--track_noise_warmup_frames", "3",
         "--track_context_scale", "0.1",
-        "--enable_dit_lora", "1",
+        "--enable_dit_lora", "0",
         "--lora_target_modules", "q,k,v,o,ffn.0,ffn.2",
         "--lora_rank", "32",
     ]
@@ -282,7 +286,11 @@ if __name__ == "__main__":
         track_point_radius=args.track_point_radius,
         track_seed=args.track_seed,
         track_apply_noise=bool(args.track_apply_noise),
-        track_noise_std=args.track_noise_std,
+        track_noise_corrupt_ratio=args.track_noise_corrupt_ratio,
+        track_noise_offset_scale=args.track_noise_offset_scale,
+        track_noise_drift_scale=args.track_noise_drift_scale,
+        track_noise_dropout_ratio=args.track_noise_dropout_ratio,
+        track_noise_warmup_frames=args.track_noise_warmup_frames,
     )
     model = WanTrainingModule(
         model_paths=model_paths_json,
